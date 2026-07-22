@@ -40,6 +40,13 @@ class AutoSwitchSettings:
     re-triggers next tick) and beat the active account's utilization by at
     least ``hysteresis_pct``, so two accounts hovering at the line never
     ping-pong while a strictly better account is always taken.
+
+    ``five_hour_threshold`` / ``seven_day_threshold`` are optional per-window
+    overrides. When set, the engine triggers on that window at its own
+    threshold instead of the shared ``threshold``; when None (default) the
+    window falls back to ``threshold`` (so leaving both unset reproduces the
+    plain binding-window behavior exactly). Read them through ``eff_5h`` /
+    ``eff_7d`` rather than the raw fields.
     """
 
     threshold: float = 90.0
@@ -56,6 +63,34 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Optional per-window trigger thresholds; None → fall back to ``threshold``.
+    five_hour_threshold: float | None = None
+    seven_day_threshold: float | None = None
+
+    def eff_5h(self) -> float:
+        """Effective 5-hour trigger threshold (override or shared fallback)."""
+        return (
+            self.five_hour_threshold
+            if self.five_hour_threshold is not None
+            else self.threshold
+        )
+
+    def eff_7d(self) -> float:
+        """Effective 7-day trigger threshold (override or shared fallback)."""
+        return (
+            self.seven_day_threshold
+            if self.seven_day_threshold is not None
+            else self.threshold
+        )
+
+    def min_effective_threshold(self) -> float:
+        """Lowest effective trigger threshold across every window.
+
+        The usage-fetch escalation band keys off this so a per-window override
+        that lowers a threshold still escalates candidate refetches in time
+        for the switch it will cause.
+        """
+        return min(self.eff_5h(), self.eff_7d(), self.threshold)
 
 
 @dataclass(frozen=True)
@@ -104,6 +139,16 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
             help="Switch when the binding 5h/7d window reaches this pct",
+        ),
+        SettingSpec(
+            "autoswitch", "fiveHourThreshold", "five_hour_threshold", "float",
+            50.0, 99.9,
+            help="Per-window 5h trigger pct (unset falls back to threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "sevenDayThreshold", "seven_day_threshold", "float",
+            50.0, 99.9,
+            help="Per-window 7d trigger pct (unset falls back to threshold)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -430,6 +475,8 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("five_hour_threshold", "five_hour_threshold"),
+        ("seven_day_threshold", "seven_day_threshold"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

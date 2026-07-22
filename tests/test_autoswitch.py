@@ -2451,3 +2451,124 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+class TestPerWindowThresholds:
+    """--5h-threshold / --7d-threshold overrides, consume-first 5h-only
+    landing with 7d deprioritization, and the 99% proactive escape."""
+
+    def _h(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_consume_first_lands_on_7d_heavy_when_5h_is_free(self, temp_home):
+        # Example B: active 5h-bound; only viable peer has an empty 5h but a
+        # near-maxed 7d. The 5h-only landing gate lets it in (7d never blocks
+        # a consume-first landing), so the 5h pressure is relieved.
+        h = self._h(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 40, _R_LATER),
+            "2": _usage7(5, 92, _R_SOON),
+            "3": _usage7(95, 10, _R_LATEST),   # 5h over threshold -> not a landing
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_best_still_rejects_7d_heavy_landing(self, temp_home):
+        # Same shape as above but strategy=best: the max-fold landing gate is
+        # unchanged, so the 7d-heavy peer is rejected and best holds.
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 40, _R_LATER),
+            "2": _usage7(5, 92, _R_SOON),
+            "3": _usage7(95, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["no-qualifying-candidate"]
+
+    def test_7d_heavy_candidate_is_deprioritized_below_lighter(self, temp_home):
+        # Example D: with --7d-threshold 80, a sooner-resetting but 7d-heavy
+        # peer sinks below a later-resetting light peer.
+        h = self._h(temp_home, seven_day_threshold=80.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(10, 85, _R_SOON),     # 7d-heavy -> deprioritized
+            "3": _usage7(30, 50, _R_LATEST),   # lighter -> wins despite later
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_all_7d_heavy_still_switches_by_soonest(self, temp_home):
+        # Example E: every peer is 7d-heavy, so deprioritization can't break
+        # the tie; the soonest-resetting one is taken (fallback, 5h relief).
+        h = self._h(temp_home, seven_day_threshold=80.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 10, _R_LATER),
+            "2": _usage7(10, 85, _R_LATEST),
+            "3": _usage7(5, 90, _R_SOON),      # soonest among the heavy -> wins
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_7d_threshold_triggers_while_5h_is_healthy(self, temp_home):
+        # Example F: --7d-threshold 70 fires a weekly-driven switch even though
+        # the 5h window is well under the shared threshold.
+        h = self._h(temp_home, seven_day_threshold=70.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(40, 75, _R_LATER),    # 7d 75 >= 70 -> over threshold
+            "2": _usage7(10, 20, _R_SOON),
+            "3": _usage7(10, 20, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_7d_healthy_holds_without_override(self, temp_home):
+        # Control for the previous test: without the override the same usage is
+        # below threshold on every window, and the active resets soonest, so
+        # consume-first holds.
+        h = self._h(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(40, 75, _R_SOON),
+            "2": _usage7(10, 20, _R_LATER),
+            "3": _usage7(10, 20, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_escape_switches_when_active_critical_and_no_landing(self, temp_home):
+        # Example G: active >= the 99% escape line, every peer fails the normal
+        # 5h landing gate, so the wedge-breaker takes the best live account.
+        h = self._h(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(99.5, 20, _R_LATER),
+            "2": _usage7(95, 30, _R_SOON),     # over gate but more headroom
+            "3": _usage7(98, 30, _R_LATEST),   # over gate, less headroom
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+
+    def test_no_escape_below_99(self, temp_home):
+        # The escape has a floor: at 95% (over threshold but under the escape
+        # line) with no qualifying landing, the tick holds rather than taking
+        # an over-threshold peer.
+        h = self._h(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(92, 30, _R_SOON),
+            "3": _usage7(93, 30, _R_LATEST),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)

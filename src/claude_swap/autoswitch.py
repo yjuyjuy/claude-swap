@@ -78,6 +78,15 @@ NO_RESET_FALLBACK_S = 300.0
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
 
+# Wedge-breaker: at or above this binding-window utilization the active
+# account is effectively unusable, so force an at-limit switch (which skips
+# the healthy-landing gate and takes any live account) even when the normal
+# per-window thresholds or the consume-first landing filter would find no
+# qualifying target. Without it an unattended `cswap auto` session could sit
+# pinned to a maxed account until its next reset. 99 (not 100) leaves a tick
+# of margin before a hard block.
+ESCAPE_UTILIZATION_PCT = 99.0
+
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
 # every account in parallel, and the per-account cadence itself (movement,
@@ -371,6 +380,45 @@ def _window_pcts(
 _limiting_reset_ts = poll_policy.limiting_reset_ts
 _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
+
+
+def _below_threshold_detail(
+    active_pcts: dict[str, float],
+    utilization: float,
+    settings: "AutoSwitchSettings",
+) -> str:
+    """Human detail for a below-threshold hold.
+
+    Reports the window nearest its own effective threshold (the next one that
+    would trigger a switch) as ``pct% < threshold%``. With no per-window
+    overrides every window shares ``threshold`` and the nearest is simply the
+    binding (highest-utilization) window, reproducing the plain detail. Falls
+    back to the binding utilization when no window pct is available.
+    """
+    if active_pcts:
+        label = max(
+            active_pcts,
+            key=lambda lbl: active_pcts[lbl] - _window_threshold(lbl, settings),
+        )
+        return (
+            f"{pct_label(active_pcts[label])}% < "
+            f"{pct_label(_window_threshold(label, settings))}%"
+        )
+    return f"{pct_label(utilization)}% < {pct_label(settings.threshold)}%"
+
+
+def _window_threshold(label: str, settings: "AutoSwitchSettings") -> float:
+    """Effective trigger threshold for one usage window.
+
+    5h/7d read their per-window overrides (falling back to the shared
+    threshold); every other window (per-model scoped limits) uses the shared
+    threshold, which has no per-window override in this feature.
+    """
+    if label == "5h":
+        return settings.eff_5h()
+    if label == "7d":
+        return settings.eff_7d()
+    return settings.threshold
 
 
 def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
@@ -704,7 +752,7 @@ class AutoSwitchEngine:
         }
 
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+            current, quarantined, threshold=settings.min_effective_threshold()
         )
         self._emit(
             PollEvent(
@@ -746,16 +794,28 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            # Per-window trigger: each window crosses its own effective
+            # threshold (5h/7d overrides, or the shared threshold for scoped
+            # windows). With no overrides every window keys off ``threshold``,
+            # so ``over_threshold`` reduces to the old binding-window test
+            # (max-fold utilization >= threshold).
+            active_pcts = _window_pcts(
+                usage.get(current) if isinstance(usage.get(current), dict) else None,
+                self._models,
+            )
+            over_threshold = any(
+                pct >= _window_threshold(label, settings)
+                for label, pct in active_pcts.items()
+            )
+            if not over_threshold:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
                             # Both sides through pct_label: .0f utilization could
                             # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                            detail=_below_threshold_detail(
+                                active_pcts, utilization, settings
                             ),
                         )
                     )
@@ -905,6 +965,36 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=self.clock(),
             )
+
+        if (
+            not ordered
+            and trigger == "proactive"
+            and active_headroom is not None
+            and (100.0 - active_headroom) >= ESCAPE_UTILIZATION_PCT
+        ):
+            # Wedge-breaker: a proactive tick where the active account is
+            # critically high (>= the escape line, but short of the 100% that
+            # would already classify at-limit) yet no candidate cleared the
+            # normal landing gate. Holding to the next reset would strand an
+            # unattended session, so fall back to an at-limit rank (landing
+            # gate skipped) and take the best live account — least-bad beats
+            # wedged. Deliberately not for the consume-first trigger: that path
+            # never re-classifies mid-tick (a 100% active escapes on the next
+            # tick's normal at-limit classification).
+            escaped, any_known, active_reset_ts = self._rank_candidates(
+                trigger="at-limit",
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=self.clock(),
+            )
+            if escaped:
+                ordered = escaped
+                trigger = "at-limit"
 
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
@@ -1083,12 +1173,28 @@ class AutoSwitchEngine:
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
+            cand_pcts = (
+                _window_pcts(
+                    usage.get(num) if isinstance(usage.get(num), dict) else None,
+                    self._models,
+                )
+                if consume_first
+                else {}
+            )
             if trigger in ("proactive", "consume-first"):
-                # Landing must be healthy: an account at/over the threshold
-                # would re-trigger on the very next tick. At-limit and failover
-                # are escapes that skip this whole block — any account with real
-                # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold:
+                # Landing must be healthy: an account already over the trigger
+                # would re-fire on the very next tick. best keeps the binding
+                # (max-fold) gate; consume-first gates on the 5h window only
+                # (staying under the 5h limit is the priority), so a 7d-heavy
+                # but 5h-idle account is still a valid landing — its weekly load
+                # only deprioritizes it in the ranking below. At-limit and
+                # failover skip this block entirely (any live account beats a
+                # blocked or dead one).
+                if consume_first:
+                    five_h = cand_pcts.get("5h")
+                    if five_h is not None and five_h >= settings.eff_5h():
+                        continue
+                elif (100.0 - h) >= settings.threshold:
                     continue
                 if consume_first:
                     # Purely proactive on reset ordering: below the threshold,
@@ -1108,9 +1214,18 @@ class AutoSwitchEngine:
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
             if consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
+                # 7d-heavy targets (at/over the effective 7d threshold) sink
+                # below lighter ones — deprioritize, not exclude, so 5h relief
+                # still wins when they are the only option. Within a tier:
+                # soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
-                key: tuple = (reset_ts if reset_ts is not None else float("inf"), -h)
+                seven_d = cand_pcts.get("7d")
+                heavy = 1 if (seven_d is not None and seven_d >= settings.eff_7d()) else 0
+                key: tuple = (
+                    heavy,
+                    reset_ts if reset_ts is not None else float("inf"),
+                    -h,
+                )
             else:
                 key = (-h,)
             qualifying.append((key, num))
@@ -1226,7 +1341,7 @@ class AutoSwitchEngine:
         # The caller's tick-snapshotted threshold, so one tick fetches and
         # decides on the same value even if apply_threshold() lands mid-tick.
         if threshold is None:
-            threshold = self.settings.threshold
+            threshold = self.settings.min_effective_threshold()
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (

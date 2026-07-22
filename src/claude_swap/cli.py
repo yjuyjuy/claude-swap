@@ -572,6 +572,26 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--5h-threshold",
+        dest="five_hour_threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Per-window 5h trigger pct (50-99.9); overrides --threshold for "
+            "the 5-hour window only. Unset: falls back to --threshold"
+        ),
+    )
+    parser.add_argument(
+        "--7d-threshold",
+        dest="seven_day_threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Per-window 7d trigger pct (50-99.9); overrides --threshold for "
+            "the 7-day window only. Unset: falls back to --threshold"
+        ),
+    )
+    parser.add_argument(
         "--cooldown",
         type=float,
         metavar="SECONDS",
