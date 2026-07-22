@@ -279,3 +279,45 @@ class TestMergedWithCli:
     def test_strategy_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
+
+
+class TestPerWindowThresholdSettings:
+    def test_defaults_none_fall_back_to_threshold(self):
+        s = AutoSwitchSettings(threshold=88.0)
+        assert s.five_hour_threshold is None
+        assert s.seven_day_threshold is None
+        assert s.eff_5h() == 88.0
+        assert s.eff_7d() == 88.0
+        assert s.min_effective_threshold() == 88.0
+
+    def test_overrides_win_over_threshold(self):
+        s = AutoSwitchSettings(
+            threshold=90.0, five_hour_threshold=95.0, seven_day_threshold=70.0
+        )
+        assert s.eff_5h() == 95.0
+        assert s.eff_7d() == 70.0
+        assert s.min_effective_threshold() == 70.0
+
+    def test_cli_overrides_merge(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(),
+            _args(five_hour_threshold=97.0, seven_day_threshold=75.0),
+        )
+        assert merged.five_hour_threshold == 97.0
+        assert merged.seven_day_threshold == 75.0
+
+    def test_config_set_and_load_roundtrip(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.fiveHourThreshold", "96")
+        set_setting(tmp_path, "autoswitch.sevenDayThreshold", "72")
+        loaded = load_settings(tmp_path)
+        assert loaded.five_hour_threshold == 96.0
+        assert loaded.seven_day_threshold == 72.0
+
+    def test_config_set_rejects_out_of_range(self, tmp_path: Path):
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, "autoswitch.sevenDayThreshold", "10")
+
+    def test_unset_restores_fallback(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.sevenDayThreshold", "72")
+        assert unset_setting(tmp_path, "autoswitch.sevenDayThreshold") is True
+        assert load_settings(tmp_path).seven_day_threshold is None
