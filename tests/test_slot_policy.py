@@ -64,6 +64,8 @@ class TestSlotPolicySettings:
     def test_absent_configuration_keeps_shared_profile_mode_off(self, tmp_path: Path):
         assert load_shared_profile_settings(tmp_path) == SharedProfileSettings()
         assert load_shared_profile_settings(tmp_path).enabled is False
+        assert load_shared_profile_settings(tmp_path).dwell_seconds == 900
+        assert load_shared_profile_settings(tmp_path).material_usage_delta_pct == 1.0
         assert load_slot_policies(tmp_path) == {}
         assert DEFAULT_SLOT_POLICY == SlotPolicy(
             five_hour_ceiling_pct=90.0,
@@ -111,6 +113,34 @@ class TestSlotPolicySettings:
         )
         assert load_shared_profile_settings(tmp_path).enabled is True
         assert load_settings(tmp_path) == AutoSwitchSettings()
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("autoswitch.sharedProfile.dwellSeconds", "299"),
+            ("autoswitch.sharedProfile.dwellSeconds", "3601"),
+            ("autoswitch.sharedProfile.materialUsageDeltaPct", "0.49"),
+            ("autoswitch.sharedProfile.materialUsageDeltaPct", "10.01"),
+            ("autoswitch.sharedProfile.materialUsageDeltaPct", "nan"),
+            ("autoswitch.sharedProfile.materialUsageDeltaPct", "inf"),
+        ],
+    )
+    def test_shared_controller_settings_reject_unsafe_bounds(
+        self, tmp_path: Path, key: str, value: str
+    ):
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, key, value)
+
+    def test_shared_controller_settings_round_trip(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.sharedProfile.dwellSeconds", "300")
+        set_setting(
+            tmp_path, "autoswitch.sharedProfile.materialUsageDeltaPct", "0.5"
+        )
+
+        assert load_shared_profile_settings(tmp_path) == SharedProfileSettings(
+            dwell_seconds=300,
+            material_usage_delta_pct=0.5,
+        )
 
     def test_generic_config_command_cannot_write_slot_policy_json(
         self, tmp_path: Path

@@ -106,7 +106,7 @@ class UiSettings:
 
 @dataclass(frozen=True)
 class SharedProfileSettings:
-    """Feature gate for the shared managed-profile controller.
+    """Feature gate and global guards for shared-profile rotation.
 
     Policy configuration is safe to prepare before activation. Merely adding a
     slot policy must never enable shared-profile rotation, so the gate defaults
@@ -114,6 +114,8 @@ class SharedProfileSettings:
     """
 
     enabled: bool = False
+    dwell_seconds: int = 900
+    material_usage_delta_pct: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -212,7 +214,21 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch.sharedProfile", "enabled", "enabled", "bool",
-            help="Enable the fail-closed shared managed-profile controller",
+            help="Enable fail-closed shared-profile rotation",
+        ),
+        SettingSpec(
+            "autoswitch.sharedProfile", "dwellSeconds", "dwell_seconds", "int",
+            300, 3600,
+            help="Minimum residence time for paced voluntary switches",
+        ),
+        SettingSpec(
+            "autoswitch.sharedProfile",
+            "materialUsageDeltaPct",
+            "material_usage_delta_pct",
+            "float",
+            0.5,
+            10.0,
+            help="Same-reset raw usage increase required for a paced switch",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -649,7 +665,36 @@ def load_shared_profile_settings(backup_root: Path) -> SharedProfileSettings:
     enabled = shared.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ConfigError("autoswitch.sharedProfile.enabled must be true or false")
-    return SharedProfileSettings(enabled=enabled)
+    dwell_spec = SETTING_SPECS["autoswitch.sharedProfile.dwellSeconds"]
+    dwell = shared.get("dwellSeconds", dwell_spec.default)
+    if (
+        isinstance(dwell, bool)
+        or not isinstance(dwell, int)
+        or not dwell_spec.lo <= dwell <= dwell_spec.hi
+    ):
+        raise ConfigError(
+            "autoswitch.sharedProfile.dwellSeconds must be an integer "
+            f"between {dwell_spec.lo:g} and {dwell_spec.hi:g}"
+        )
+    delta_spec = SETTING_SPECS[
+        "autoswitch.sharedProfile.materialUsageDeltaPct"
+    ]
+    delta = shared.get("materialUsageDeltaPct", delta_spec.default)
+    if (
+        isinstance(delta, bool)
+        or not isinstance(delta, (int, float))
+        or not math.isfinite(delta)
+        or not delta_spec.lo <= delta <= delta_spec.hi
+    ):
+        raise ConfigError(
+            "autoswitch.sharedProfile.materialUsageDeltaPct must be a finite "
+            f"number between {delta_spec.lo:g} and {delta_spec.hi:g}"
+        )
+    return SharedProfileSettings(
+        enabled=enabled,
+        dwell_seconds=dwell,
+        material_usage_delta_pct=float(delta),
+    )
 
 
 def load_slot_policies(backup_root: Path) -> dict[int, SlotPolicy]:
