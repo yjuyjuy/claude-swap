@@ -14,7 +14,10 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
+import json
+from pathlib import Path
+import time
 from typing import TYPE_CHECKING
 
 from rich.text import Text
@@ -25,13 +28,29 @@ from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
 from claude_swap.autoswitch import (
+    STATE_FILENAME,
     AutoSwitchEngine,
     AutoSwitchEvent,
     binding_pct,
     pct_label,
 )
-from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.paced_selector import (
+    material_usage_changed,
+    rank_paced_slots,
+    verified_eligible,
+)
+from claude_swap.poll_policy import parse_reset_ts
+from claude_swap.settings import (
+    DEFAULT_SLOT_POLICY,
+    SETTING_SPECS,
+    SharedProfileSettings,
+    SlotPolicy,
+    load_settings,
+    load_shared_profile_settings,
+    load_slot_policies,
+    parse_model_names,
+)
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
@@ -47,6 +66,326 @@ _EVENT_ROLES = {
     "all-exhausted": "sev_crit",
 }
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
+
+
+@dataclass(frozen=True)
+class SharedProfileObservability:
+    """Read-only terminal renderables for shared-profile controller proof."""
+
+    enabled: bool
+    policies: Text
+    controller: Text
+
+
+def shared_profile_observability(
+    snap: AccountsSnapshot,
+    backup_root: Path,
+    *,
+    now: float | None = None,
+    unhealthy_ticks: int,
+) -> SharedProfileObservability:
+    """Render effective slot policy and proof facts without mutating either."""
+    now = time.time() if now is None else now
+    shared = load_shared_profile_settings(backup_root)
+    explicit = load_slot_policies(backup_root)
+    accounts = {int(account.number): account for account in snap.accounts}
+    effective_policies = {
+        account.number: explicit.get(int(account.number), DEFAULT_SLOT_POLICY)
+        for account in snap.accounts
+        if account.switchable and not account.disabled and account.kind != "api_key"
+    }
+
+    policies = Text("SLOT POLICIES  CLI writes · TUI observes\n", style="bold")
+    policies.append(
+        "slot  occupant                 usage / ceiling          source / priority  eligibility\n",
+        style="dim",
+    )
+    for slot in sorted(set(accounts) | set(explicit)):
+        account = accounts.get(slot)
+        policy = explicit.get(slot, DEFAULT_SLOT_POLICY)
+        source = (
+            "explicit"
+            if account is not None and slot in explicit
+            else "defaulted"
+            if account is not None
+            else "vacant"
+        )
+        occupant = account.email if account is not None else "vacant"
+        usage = (
+            f"—/{policy.five_hour_ceiling_pct:g}% · "
+            f"—/{policy.weekly_ceiling_pct:g}%"
+        )
+        eligibility = "vacant"
+        if account is not None:
+            entry = account.usage
+            structural_failure = (
+                "disabled"
+                if account.disabled
+                else "API key"
+                if account.kind == "api_key"
+                else "not switchable"
+                if not account.switchable
+                else None
+            )
+            fresh_usage = _fresh_usage(account, now)
+            if fresh_usage is not None:
+                five = data.window_pct(fresh_usage, "five_hour")
+                weekly = data.window_pct(fresh_usage, "seven_day")
+                if five is not None and weekly is not None:
+                    usage = (
+                        f"{five:g}/{policy.five_hour_ceiling_pct:g}% · "
+                        f"{weekly:g}/{policy.weekly_ceiling_pct:g}%"
+                    )
+                if structural_failure is not None:
+                    eligibility = f"ineligible · {structural_failure}"
+                elif verified_eligible(fresh_usage, policy):
+                    eligibility = "eligible · fresh"
+                else:
+                    capped = []
+                    if five is not None and five >= policy.five_hour_ceiling_pct:
+                        capped.append("5h capped")
+                    if weekly is not None and weekly >= policy.weekly_ceiling_pct:
+                        capped.append("weekly capped")
+                    eligibility = (
+                        "ineligible · " + ", ".join(capped)
+                        if capped
+                        else "ineligible · incomplete windows"
+                    )
+            else:
+                if entry.sentinel is not None:
+                    reason = data.sentinel_label(entry.sentinel)
+                elif entry.last_error is not None:
+                    reason = f"poll failed: {entry.last_error}"
+                elif entry.age_s is not None and entry.last_good is not None:
+                    reason = f"stale proof {data.format_duration(entry.age_s)}"
+                else:
+                    reason = "proof unavailable"
+                reasons = (
+                    f"{structural_failure}; {reason}"
+                    if structural_failure is not None
+                    else reason
+                )
+                eligibility = f"ineligible · {reasons}"
+        policies.append(
+            f"{slot:<5} {occupant:<24} {usage:<24} "
+            f"{source} · pri {policy.priority:<4} {eligibility}\n"
+        )
+
+    try:
+        raw_state = json.loads(
+            (backup_root / STATE_FILENAME).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raw_state = {}
+    controller_state = (
+        raw_state.get("sharedProfileController")
+        if isinstance(raw_state, dict)
+        else None
+    )
+    controller = _controller_proof_text(
+        controller_state,
+        snap=snap,
+        shared=shared,
+        policies=effective_policies,
+        now=now,
+        unhealthy_ticks=unhealthy_ticks,
+    )
+    return SharedProfileObservability(shared.enabled, policies, controller)
+
+
+def _controller_proof_text(
+    state: object,
+    *,
+    snap: AccountsSnapshot,
+    shared: SharedProfileSettings,
+    policies: dict[str, SlotPolicy],
+    now: float,
+    unhealthy_ticks: int,
+) -> Text:
+    text = Text("CONTROLLER PROOF\n", style="bold")
+    if not isinstance(state, dict):
+        text.append("STATE   awaiting controller proof", style="dim")
+        return text
+
+    phase = str(state.get("phase") or "unknown")
+    text.append(f"STATE   {phase}\n", style="cyan")
+    if phase == "priming-pending":
+        slot = state.get("activeSlot", "unknown")
+        baseline = state.get("baselineFiveHourResetAt")
+        text.append(f"PIN     slot {slot} · active profile remains pinned\n")
+        text.append(
+            "BASE    5h reset "
+            f"{baseline if baseline is not None else 'unopened / unknown'}\n"
+        )
+        text.append(
+            "PROOF   waiting for fresh post-activation 5h reset advance\n"
+        )
+        failures = int(state.get("failedPolls", 0))
+        escalation = (
+            "escalated · profile remains pinned"
+            if state.get("escalated")
+            else "below escalation threshold"
+        )
+        text.append(
+            f"FAIL    {failures}/{unhealthy_ticks} proof polls · {escalation}"
+        )
+        return text
+
+    primed = state.get("primedSlots")
+    if isinstance(primed, list):
+        label = ", ".join(str(slot) for slot in primed) or "none"
+        text.append(f"PROOF   confirmed primed slots: {label}\n")
+    active = state.get("activeSlot")
+    if active is not None:
+        text.append(f"ACTIVE  slot {active}\n")
+    if phase == "steady":
+        fresh_usage = {
+            account.number: usage
+            for account in snap.accounts
+            if (usage := _fresh_usage(account, now)) is not None
+            if account.number in policies
+        }
+        ranked = rank_paced_slots(fresh_usage, policies, now)
+        paced = [
+            slot
+            for slot in ranked
+            if (
+                weekly_reset := parse_reset_ts(
+                    fresh_usage[slot]["seven_day"].get("resets_at")
+                )
+            )
+            is not None
+            and weekly_reset > now
+        ]
+        fallback = [slot for slot in ranked if slot not in paced]
+        if paced:
+            text.append(
+                f"RANK    {' > '.join(paced)} · slot {paced[0]} "
+                "leads configured-maximum pace\n"
+            )
+        if fallback:
+            text.append(
+                f"FALLBACK {' > '.join(fallback)} · weekly reset unavailable; "
+                "5h urgency then priority/slot\n"
+            )
+        if not ranked:
+            text.append(
+                "RANK    no verified eligible slot · fail-closed fallback\n"
+            )
+        dwell_until = state.get("dwellUntil")
+        if isinstance(dwell_until, (int, float)):
+            if dwell_until > now:
+                text.append(
+                    f"DWELL   {data.format_duration(dwell_until - now)} remaining "
+                    "· voluntary move blocked\n"
+                )
+            else:
+                text.append("DWELL   complete · voluntary move permitted\n")
+        else:
+            text.append(
+                "DWELL   proof unavailable · voluntary move blocked\n"
+            )
+
+        account = next(
+            (item for item in snap.accounts if item.number == str(active)),
+            None,
+        )
+        current_usage = (
+            _fresh_usage(account, now) if account is not None else None
+        )
+        baseline = state.get("activationUsage")
+        if current_usage is None:
+            text.append(
+                "CHANGE  proof unavailable · active usage is not fresh"
+            )
+            return text
+        changed = material_usage_changed(
+            baseline, current_usage, shared.material_usage_delta_pct
+        )
+        delta = _largest_same_reset_delta(baseline, current_usage)
+        if changed:
+            text.append(
+                f"CHANGE  confirmed · {delta:g}pp >= "
+                f"{shared.material_usage_delta_pct:g}pp same-reset"
+            )
+        else:
+            text.append(
+                "CHANGE  waiting · need "
+                f"{shared.material_usage_delta_pct:g}pp same-reset material usage"
+            )
+    elif phase == "selecting":
+        text.append(
+            f"SELECT  slot {state.get('targetSlot', 'unknown')} · "
+            f"{state.get('reason', 'unknown')}\n"
+        )
+        text.append(f"SNAP    {state.get('snapshotRevision', 'unknown')}\n")
+        text.append(
+            "CHECK   fresh active + target; policy, identity, ranking"
+        )
+    elif phase == "verification-blocked":
+        reason = str(state.get("reason") or "fresh all-slot proof incomplete")
+        text.append(f"REASON  {reason.replace('-', ' ')}\n")
+        if state.get("allCapped") is True:
+            text.append("CAPS    all slots freshly proved capped\n")
+        else:
+            text.append("CAPS    not proved all-capped · bounded fresh poll\n")
+        proposed = state.get("proposedParkSlot")
+        if proposed is not None:
+            text.append(
+                f"PARK    proposed slot {proposed} · blocked; "
+                f"retaining active slot {active}\n"
+            )
+        wake_at = state.get("wakeAt")
+        if isinstance(wake_at, (int, float)):
+            if wake_at > now:
+                text.append(
+                    f"WAKE    in {data.format_duration(wake_at - now)} · "
+                    "earliest complete capped-window recovery"
+                )
+            else:
+                text.append(
+                    f"WAKE    overdue by {data.format_duration(now - wake_at)} "
+                    "· recovery poll due now"
+                )
+        else:
+            text.append(
+                "WAKE    unknown · capped reset proof incomplete; bounded fresh poll"
+            )
+    return text
+
+
+def _fresh_usage(account: AccountSnapshot, now: float) -> dict | None:
+    entry = account.usage
+    if (
+        entry.sentinel is None
+        and entry.last_error is None
+        and entry.fresh(now)
+        and isinstance(entry.last_good, dict)
+    ):
+        return entry.last_good
+    return None
+
+
+def _largest_same_reset_delta(baseline: object, fresh: object) -> float:
+    if not isinstance(baseline, dict) or not isinstance(fresh, dict):
+        return 0.0
+    deltas = []
+    for key in ("five_hour", "seven_day"):
+        before = baseline.get(key)
+        after = fresh.get(key)
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            continue
+        before_pct = before.get("pct")
+        after_pct = after.get("pct")
+        if (
+            isinstance(before_pct, (int, float))
+            and not isinstance(before_pct, bool)
+            and isinstance(after_pct, (int, float))
+            and not isinstance(after_pct, bool)
+            and before.get("resets_at") == after.get("resets_at")
+        ):
+            deltas.append(float(after_pct) - float(before_pct))
+    return max(deltas, default=0.0)
 
 
 def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
@@ -78,6 +417,7 @@ class AutoScreen(Screen):
         super().__init__()
         self._engine: AutoSwitchEngine | None = None
         self._settings = None
+        self._shared_profile = SharedProfileSettings()
         # Session-only threshold adjustment (t, then arrows). Never written
         # to settings.json — same memory-only precedent as the dry-run
         # toggle. ``_configured_threshold`` is the mount-time file value the
@@ -94,6 +434,9 @@ class AutoScreen(Screen):
                 yield Static(" DRY-RUN ", id="mode-badge", classes="dry")
                 yield Static("", id="auto-summary")
             yield Static("", id="candidates")
+            with Horizontal(id="shared-observability"):
+                yield Static("", id="slot-policies")
+                yield Static("", id="controller-proof")
         yield RichLog(id="event-log", highlight=False, markup=False, wrap=True)
         yield Footer()
 
@@ -102,6 +445,9 @@ class AutoScreen(Screen):
     def on_mount(self) -> None:
         self.app.set_store_only(True)
         self._settings = load_settings(self.app.switcher.backup_dir)
+        self._shared_profile = load_shared_profile_settings(
+            self.app.switcher.backup_dir
+        )
         # The bar tick everywhere reads app.threshold_pct, loaded once at app
         # startup — sync it to the fresh file value so bars and engine agree,
         # and remember that value: unmount restores it (only the session
@@ -192,6 +538,22 @@ class AutoScreen(Screen):
     def _update_summary(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
+        if self._shared_profile.enabled:
+            text.append("shared-profile rotation · read-only policy + proof")
+            text.append(
+                f" · threshold {pct_label(self._settings.threshold)}%",
+                style=palette.accent if self._adjusting else palette.muted,
+            )
+            if self._settings.threshold != self._configured_threshold:
+                text.append(" (session)", style=palette.muted)
+            text.append(
+                f" · poll every {self._settings.interval_seconds:.0f}s",
+                style=palette.muted,
+            )
+            if self._adjusting:
+                text.append("   ← → adjust · enter done", style=palette.muted)
+            self.query_one("#auto-summary", Static).update(text)
+            return
         text.append("auto-switch · ")
         text.append(
             f"threshold {pct_label(self._settings.threshold)}%",
@@ -244,6 +606,8 @@ class AutoScreen(Screen):
             return
         palette = Palette.from_theme(self.app.current_theme)
         self.query_one("#event-log", RichLog).write(event_text(event, palette=palette))
+        if self._shared_profile.enabled and self.app.snapshot is not None:
+            self._update_shared_observability(self.app.snapshot)
         if event.kind == "switch":
             self.app.request_refresh()
 
@@ -287,9 +651,25 @@ class AutoScreen(Screen):
     def _on_snapshot(self, snap: AccountsSnapshot | None) -> None:
         if snap is None:
             return
+        if self._shared_profile.enabled:
+            self._update_shared_observability(snap)
+            return
+        self.query_one("#shared-observability").display = False
+        self.query_one("#candidates", Static).display = True
         self.query_one("#candidates", Static).update(
             self._candidates_text(snap, active_number=snap.active_number)
         )
+
+    def _update_shared_observability(self, snap: AccountsSnapshot) -> None:
+        view = shared_profile_observability(
+            snap,
+            self.app.switcher.backup_dir,
+            unhealthy_ticks=self._settings.unhealthy_ticks,
+        )
+        self.query_one("#candidates", Static).display = False
+        self.query_one("#shared-observability").display = True
+        self.query_one("#slot-policies", Static).update(view.policies)
+        self.query_one("#controller-proof", Static).update(view.controller)
 
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
