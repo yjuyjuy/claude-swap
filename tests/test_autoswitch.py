@@ -1066,11 +1066,23 @@ class TestSharedProfileRotationController:
         (h.switcher.backup_dir / "autoswitch_state.json").unlink()
         usage = self._usage()
 
-        with patch.object(
-            h.switcher, "fetch_usage_now", return_value=usage["1"]
-        ) as recheck:
-            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        entries = {
+            num: _entry_for(value, h.clock.now)
+            for num, value in usage.items()
+        }
+        with (
+            patch.object(
+                h.switcher,
+                "usage_entries_by_account",
+                return_value=entries,
+            ) as collect,
+            patch.object(
+                h.switcher, "fetch_usage_now", return_value=usage["1"]
+            ) as recheck,
+        ):
+            assert h.engine.tick() is TickOutcome.NO_ACTION
 
+        collect.assert_called_once_with(fetch={"1", "2"}, force=True)
         recheck.assert_called_once_with("1")
         pending = h.state()["sharedProfileController"]
         assert pending["phase"] == "priming-pending"

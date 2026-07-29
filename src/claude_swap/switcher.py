@@ -1380,7 +1380,11 @@ class ClaudeAccountSwitcher:
         return self._usage_by_account()
 
     def usage_entries_by_account(
-        self, fetch: set[str] | None = None, *, scheduled: bool = False
+        self,
+        fetch: set[str] | None = None,
+        *,
+        scheduled: bool = False,
+        force: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage entries (ages, errors, poll state) per account.
 
@@ -1388,10 +1392,15 @@ class ClaudeAccountSwitcher:
         auto engine's scheduler); ``None`` means every stale account is
         eligible (on-demand callers). ``scheduled=True`` preserves valid
         future plans while still allowing due plans to beat the serve TTL.
+        ``force`` obtains same-epoch proof for safety-critical decisions
+        while retaining claim/backoff guards.
         """
         accounts_info = self._build_accounts_info()
         return self._collect_usage_entries(
-            accounts_info, fetch=fetch, scheduled=scheduled
+            accounts_info,
+            fetch=fetch,
+            scheduled=scheduled,
+            force=force,
         )
 
     def fetch_usage_now(self, account_num: str) -> dict | None:
@@ -3437,6 +3446,7 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        force: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -3492,6 +3502,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=True,
                 repair_overslept=True,
+                force=force,
             )
         else:
             claims = store.reserve(
@@ -3499,6 +3510,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=False,
                 repair_overslept=scheduled,
+                force=force,
             )
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent

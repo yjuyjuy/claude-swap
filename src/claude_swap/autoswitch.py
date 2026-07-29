@@ -1955,7 +1955,10 @@ class AutoSwitchEngine:
             return self._tick_priming_pending(controller, policies, shared)
 
         epoch_started = self.clock()
-        entries = self.switcher.usage_entries_by_account(fetch=set(policies))
+        entries = self.switcher.usage_entries_by_account(
+            fetch=set(policies),
+            force=True,
+        )
         usage = {
             slot: entry.last_good
             for slot, entry in entries.items()

@@ -854,11 +854,24 @@ class TestReserve:
         store.set_poll_plan({"1": (clock.now + 600.0, 600.0)}, IDENT)
         assert set(store.reserve(["1"], IDENT, respect_plans=False)) == {"1"}
 
+    def test_forced_proof_fetches_a_fresh_not_due_entry(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 600.0, 600.0)}, IDENT)
+        clock.advance(CLAIM_TTL_S + 1)
+
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        assert set(
+            store.reserve(["1"], IDENT, respect_plans=False, force=True)
+        ) == {"1"}
+
     def test_backoff_blocks_both_modes(self, store, clock):
         store.record({"1": FetchRecord(error="timeout")}, IDENT)
         clock.advance(BACKOFF_BASE_S - 1)  # completed claim gone, backoff still on
         assert store.reserve(["1"], IDENT, respect_plans=True) == {}
         assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        assert store.reserve(
+            ["1"], IDENT, respect_plans=False, force=True
+        ) == {}
 
     def test_dead_token_never_won(self, store, clock):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
