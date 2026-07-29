@@ -1907,6 +1907,7 @@ class TestAutoScreen:
             assert policies.display is True
             assert controller.display is True
             assert candidates.display is False
+            assert policies.size.width < controller.size.width
             assert "SLOT POLICIES" in policies.render().plain
             assert "CONTROLLER PROOF" in controller.render().plain
             assert "shared-profile rotation · read-only policy + proof" in (
