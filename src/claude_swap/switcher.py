@@ -1350,6 +1350,28 @@ class ClaudeAccountSwitcher:
         accounts_info = self._build_accounts_info()
         return self._collect_usage_entries(accounts_info, fetch=fetch)
 
+    def fetch_usage_now(self, account_num: str) -> dict | None:
+        """Fetch one slot directly for a lock-held activation recheck.
+
+        This intentionally does not serve the usage cache: callers use it only
+        after nominating a target from a selection snapshot and need a new
+        provider observation before changing shared-profile rotation.
+        """
+        info = next(
+            (
+                item
+                for item in self._build_accounts_info()
+                if str(item[0]) == str(account_num)
+            ),
+            None,
+        )
+        if info is None:
+            return None
+        record = self._fetch_account_usage(info)
+        if record.error is not None or record.sentinel is not None:
+            return None
+        return record.usage if isinstance(record.usage, dict) else None
+
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
 

@@ -28,7 +28,7 @@ from claude_swap.autoswitch import (
 from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, set_setting, set_slot_policy
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -48,6 +48,18 @@ def _usage(pct: float, resets_at: str | None = None) -> dict:
     if resets_at:
         window["resets_at"] = resets_at
     return {"five_hour": window, "seven_day": {"pct": 0.0}}
+
+
+def _paced_usage(
+    five: float,
+    weekly: float,
+    five_reset: str,
+    weekly_reset: str,
+) -> dict:
+    return {
+        "five_hour": {"pct": five, "resets_at": five_reset},
+        "seven_day": {"pct": weekly, "resets_at": weekly_reset},
+    }
 
 
 def _entry_for(value: dict | str | None, now: float) -> UsageEntry:
@@ -439,6 +451,235 @@ class TestDecisionTable:
         event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
         assert event.earliest_reset_at == "2026-07-03T10:30:00Z"
         assert harness.engine._sleep_until_ts is not None
+
+
+class TestSharedProfileRotationController:
+    _FIVE_RESET = "2026-08-01T00:00:00Z"
+    _WEEKLY_SOON = "1970-01-13T00:00:00Z"
+    _WEEKLY_LATER = "1970-01-14T00:00:00Z"
+
+    def _enable(self, harness: EngineHarness) -> None:
+        root = harness.switcher.backup_dir
+        set_setting(root, "autoswitch.sharedProfile.enabled", "true")
+        set_slot_policy(
+            root, 1, five_hour_ceiling_pct=90, weekly_ceiling_pct=80
+        )
+        set_slot_policy(
+            root, 2, five_hour_ceiling_pct=90, weekly_ceiling_pct=100
+        )
+
+    def _usage(self, *, active_five: float = 10, active_weekly: float = 20):
+        return {
+            "1": _paced_usage(
+                active_five,
+                active_weekly,
+                self._FIVE_RESET,
+                self._WEEKLY_LATER,
+            ),
+            "2": _paced_usage(
+                10,
+                20,
+                self._FIVE_RESET,
+                self._WEEKLY_SOON,
+            ),
+        }
+
+    def test_steady_state_survives_restart_and_releases_after_both_gates(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        steady = h.state()["sharedProfileController"]
+        assert steady["phase"] == "steady"
+        assert steady["activeSlot"] == "1"
+
+        h.clock.advance(900)
+        h.engine = h._make_engine()
+        changed = self._usage(active_five=11)
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=lambda slot: changed[slot],
+        ):
+            assert h.tick_with_usage(changed) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.state()["sharedProfileController"]["activeSlot"] == "2"
+
+    def test_clock_only_rank_change_does_not_release_active_slot(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        usage = self._usage()
+
+        h.tick_with_usage(usage)
+        h.clock.advance(900)
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_active_at_ceiling_fails_over_immediately(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.tick_with_usage(self._usage())
+
+        capped = self._usage(active_five=90)
+        h.clock.advance(1)
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=lambda slot: capped[slot],
+        ):
+            assert h.tick_with_usage(capped) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_priming_pending_state_remains_pinned_for_ticket_11(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.switcher.backup_dir.mkdir(parents=True, exist_ok=True)
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "sharedProfileController": {
+                        "phase": "priming-pending",
+                        "activeSlot": "1",
+                    },
+                }
+            )
+        )
+
+        with patch.object(h.switcher, "fetch_usage_now") as recheck:
+            assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        recheck.assert_not_called()
+        assert h.active_number() == 1
+
+    def test_locked_recheck_loss_aborts_without_stale_fallback(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.tick_with_usage(self._usage())
+        h.clock.advance(900)
+        changed = self._usage(active_five=11)
+        target_at_ceiling = dict(changed["2"])
+        target_at_ceiling["five_hour"] = {
+            **changed["2"]["five_hour"],
+            "pct": 90,
+        }
+        selecting_states = []
+
+        def locked_usage(slot):
+            selecting_states.append(h.state()["sharedProfileController"])
+            return target_at_ceiling if slot == "2" else changed[slot]
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=locked_usage,
+        ):
+            assert h.tick_with_usage(changed) is TickOutcome.NO_ACTION
+        assert selecting_states
+        assert all(state["phase"] == "selecting" for state in selecting_states)
+        assert all(state["snapshotRevision"] for state in selecting_states)
+        assert h.active_number() == 1
+        assert h.state()["sharedProfileController"]["activeSlot"] == "1"
+
+    def test_quarantined_active_fails_over_without_dwell(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.tick_with_usage(self._usage())
+        state = h.state()
+        state["quarantine"] = {"1": {"email": "a@example.com"}}
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps(state)
+        )
+
+        usage = self._usage()
+        with (
+            patch.object(h.engine, "_release_recovered_quarantines", return_value=state),
+            patch.object(
+                h.switcher,
+                "fetch_usage_now",
+                side_effect=lambda slot: usage[slot],
+            ),
+        ):
+            assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_locked_active_reset_change_revokes_material_usage_proof(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.tick_with_usage(self._usage())
+        h.clock.advance(900)
+        changed = self._usage(active_five=11)
+        reset_changed = self._usage(active_five=12)
+        reset_changed["1"]["five_hour"]["resets_at"] = "2026-08-01T01:00:00Z"
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=lambda slot: (
+                reset_changed["1"] if slot == "1" else changed["2"]
+            ),
+        ) as fetch:
+            assert h.tick_with_usage(changed) is TickOutcome.NO_ACTION
+        assert [call.args[0] for call in fetch.call_args_list] == ["1", "2"]
+        assert h.active_number() == 1
+
+    def test_locked_target_must_remain_the_paced_winner(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        usage = self._usage()
+        usage["3"] = _paced_usage(
+            10,
+            20,
+            self._FIVE_RESET,
+            self._WEEKLY_LATER,
+        )
+        h.tick_with_usage(usage)
+        h.clock.advance(900)
+        usage["1"]["five_hour"]["pct"] = 11
+        target_slows = _paced_usage(
+            10,
+            99.9,
+            self._FIVE_RESET,
+            self._WEEKLY_SOON,
+        )
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=lambda slot: (
+                target_slows if slot == "2" else usage[slot]
+            ),
+        ):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
 
 
 class TestIdleHold:
