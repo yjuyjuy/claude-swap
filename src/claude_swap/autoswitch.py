@@ -1478,35 +1478,19 @@ class AutoSwitchEngine:
 
     def _primed_slots(
         self,
-        controller: object,
+        usage: dict[str, dict],
         policies: dict[str, SlotPolicy],
     ) -> list[str]:
-        if not isinstance(controller, dict):
-            return []
-        raw = controller.get("primedSlots")
-        if not isinstance(raw, list):
-            return []
-        primed = [
-            slot
-            for slot in raw
-            if isinstance(slot, str) and slot in policies
-        ]
-        recorded = controller.get("primedIdentities")
-        # ``priming-complete`` is the one migration marker used by the
-        # pre-priming controller tests. New operational state always binds a
-        # primed slot to its identity so a move/swap cannot inherit proof.
-        if not isinstance(recorded, dict):
-            return (
-                sorted(set(primed), key=int)
-                if controller.get("phase") == "priming-complete"
-                else []
-            )
+        """Derive priming directly from fresh provider window state."""
         return sorted(
-            {
+            (
                 slot
-                for slot in primed
-                if recorded.get(slot) == self.switcher.account_identity(slot)
-            },
+                for slot in policies
+                if _parse_reset_ts(
+                    self._five_hour_reset(usage.get(slot))
+                )
+                is not None
+            ),
             key=int,
         )
 
@@ -1619,17 +1603,10 @@ class AutoSwitchEngine:
         )
         if successful_after_activation:
             fresh_reset = self._five_hour_reset(entry.last_good)
-            baseline_reset = controller.get("baselineFiveHourResetAt")
             fresh_ts = _parse_reset_ts(fresh_reset)
-            baseline_ts = _parse_reset_ts(baseline_reset)
-            proved = fresh_ts is not None and (
-                baseline_ts is None or fresh_ts > baseline_ts
-            )
+            proved = fresh_ts is not None
             if proved:
-                primed = self._primed_slots(controller, policies)
-                if slot not in primed:
-                    primed.append(slot)
-                    primed.sort(key=int)
+                primed = [slot]
                 self._store_controller(
                     {
                         "phase": "priming",
@@ -1985,9 +1962,14 @@ class AutoSwitchEngine:
         identities = {
             slot: self.switcher.account_identity(slot) for slot in policies
         }
-        primed_slots = self._primed_slots(controller, policies)
+        primed_slots = self._primed_slots(usage, policies)
         unprimed = sorted(
-            (slot for slot in policies if slot not in primed_slots),
+            (
+                slot
+                for slot in policies
+                if slot not in primed_slots
+                and verified_eligible(usage.get(slot), policies[slot])
+            ),
             key=lambda slot: (-policies[slot].priority, int(slot)),
         )
         if unprimed:

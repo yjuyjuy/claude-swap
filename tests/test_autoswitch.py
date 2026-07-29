@@ -600,6 +600,7 @@ class TestSharedProfileRotationController:
             clock=h.clock,
         )
         usage = self._usage()
+        del usage["1"]["five_hour"]["resets_at"]
 
         with patch.object(
             h.switcher,
@@ -1094,6 +1095,7 @@ class TestSharedProfileRotationController:
         self._enable(h)
         (h.switcher.backup_dir / "autoswitch_state.json").unlink()
         usage = self._usage()
+        del usage["1"]["five_hour"]["resets_at"]
 
         entries = {
             num: _entry_for(value, h.clock.now)
@@ -1116,12 +1118,33 @@ class TestSharedProfileRotationController:
         pending = h.state()["sharedProfileController"]
         assert pending["phase"] == "priming-pending"
         assert pending["activeSlot"] == "1"
-        assert pending["baselineFiveHourResetAt"] == self._FIVE_RESET
+        assert pending["baselineFiveHourResetAt"] is None
         assert pending["activatedAt"] == h.clock.now
-        assert pending["primedSlots"] == []
+        assert pending["primedSlots"] == ["2"]
         assert h.active_number() == 1
 
-    def test_unprimed_slot_without_same_tick_proof_blocks_cleanly(
+    def test_open_five_hour_windows_are_primed_without_controller_state(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("b@example.com", 2)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        usage = self._usage()
+
+        with patch.object(h.switcher, "fetch_usage_now") as recheck:
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+
+        recheck.assert_not_called()
+        controller = h.state()["sharedProfileController"]
+        assert controller["phase"] == "steady"
+        assert controller["activeSlot"] == "2"
+        assert controller["primedSlots"] == ["1", "2"]
+        assert h.switcher.current_account_number() == "2"
+
+    def test_same_tick_gap_does_not_crash_priming_derivation(
         self, temp_home
     ):
         h = EngineHarness(temp_home)
@@ -1140,13 +1163,10 @@ class TestSharedProfileRotationController:
             "2": _entry_for(usage["2"], h.clock.now),
         }
 
-        assert h.tick_with_entries(entries) is TickOutcome.BLOCKED
+        with patch.object(h.switcher, "fetch_usage_now", return_value=None):
+            assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
-        assert any(
-            isinstance(event, NoSwitchEvent)
-            and event.reason == "priming-baseline-unavailable"
-            for event in h.events
-        )
+        assert not any(isinstance(event, ErrorEvent) for event in h.events)
 
     def test_priming_order_activates_higher_priority_slot_with_locked_baseline(
         self, temp_home
@@ -1165,13 +1185,8 @@ class TestSharedProfileRotationController:
         )
         (h.switcher.backup_dir / "autoswitch_state.json").unlink()
         usage = self._usage()
-        locked = {
-            **usage["2"],
-            "five_hour": {
-                **usage["2"]["five_hour"],
-                "resets_at": "2026-08-01T00:30:00Z",
-            },
-        }
+        del usage["2"]["five_hour"]["resets_at"]
+        locked = usage["2"]
 
         with patch.object(
             h.switcher, "fetch_usage_now", return_value=locked
@@ -1182,7 +1197,7 @@ class TestSharedProfileRotationController:
         pending = h.state()["sharedProfileController"]
         assert pending["phase"] == "priming-pending"
         assert pending["activeSlot"] == "2"
-        assert pending["baselineFiveHourResetAt"] == "2026-08-01T00:30:00Z"
+        assert pending["baselineFiveHourResetAt"] is None
         assert h.active_number() == 2
 
     def test_priming_restart_polls_only_pin_until_reset_advances(self, temp_home):
@@ -1193,6 +1208,7 @@ class TestSharedProfileRotationController:
         self._enable(h)
         (h.switcher.backup_dir / "autoswitch_state.json").unlink()
         baseline = self._usage()
+        del baseline["1"]["five_hour"]["resets_at"]
         with patch.object(
             h.switcher, "fetch_usage_now", return_value=baseline["1"]
         ):
@@ -1264,6 +1280,7 @@ class TestSharedProfileRotationController:
         self._enable(h)
         (h.switcher.backup_dir / "autoswitch_state.json").unlink()
         baseline = self._usage()
+        del baseline["1"]["five_hour"]["resets_at"]
         with patch.object(
             h.switcher, "fetch_usage_now", return_value=baseline["1"]
         ):
