@@ -14,6 +14,7 @@ from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
     AutoSwitchSettings,
+    SharedProfileSettings,
     UiSettings,
     effective_settings,
     load_settings,
@@ -162,9 +163,16 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["autoswitch.sharedProfile"] == {
+            f.name for f in SharedProfileSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "autoswitch.sharedProfile": SharedProfileSettings(),
+            "ui": UiSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 

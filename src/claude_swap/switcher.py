@@ -677,6 +677,22 @@ class ClaudeAccountSwitcher:
         ]
         return sorted(rows, key=lambda r: int(r[0]))
 
+    def slot_roster(self) -> dict[int, str]:
+        """Return current occupied slot numbers without mutating roster data."""
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        if not isinstance(accounts, dict):
+            return {}
+        roster: dict[int, str] = {}
+        for raw_slot, record in accounts.items():
+            try:
+                slot = int(raw_slot)
+            except (TypeError, ValueError):
+                continue
+            if slot >= 1 and isinstance(record, dict):
+                roster[slot] = str(record.get("email", ""))
+        return roster
+
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two accounts' slot numbers (list order / numeric targets).
 
