@@ -1872,7 +1872,7 @@ class TestAutoScreen:
 
             assert len(app.screen.query_one("#event-log", RichLog).lines) > 0
 
-    async def test_shared_profile_uses_split_read_only_proof_surface(
+    async def test_shared_profile_stacks_proof_above_full_width_policies(
         self, tmp_path, fake_engine
     ):
         settings = json.dumps(
@@ -1907,7 +1907,8 @@ class TestAutoScreen:
             assert policies.display is True
             assert controller.display is True
             assert candidates.display is False
-            assert policies.size.width < controller.size.width
+            assert controller.region.y < policies.region.y
+            assert policies.size.width == controller.size.width
             assert "SLOT POLICIES" in policies.render().plain
             assert "CONTROLLER PROOF" in controller.render().plain
             assert "shared-profile rotation · read-only policy + proof" in (

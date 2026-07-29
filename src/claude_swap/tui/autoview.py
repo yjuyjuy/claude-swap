@@ -434,9 +434,9 @@ class AutoScreen(Screen):
                 yield Static(" DRY-RUN ", id="mode-badge", classes="dry")
                 yield Static("", id="auto-summary")
             yield Static("", id="candidates")
-            with Horizontal(id="shared-observability"):
-                yield Static("", id="slot-policies")
+            with Vertical(id="shared-observability"):
                 yield Static("", id="controller-proof")
+                yield Static("", id="slot-policies")
         yield RichLog(id="event-log", highlight=False, markup=False, wrap=True)
         yield Footer()
 

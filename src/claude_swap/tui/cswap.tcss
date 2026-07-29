@@ -120,18 +120,13 @@ MenuItem Static.menu-item-muted { color: $secondary; }
 }
 
 #slot-policies, #controller-proof {
+    width: 1fr;
     height: auto;
     padding: 0 1;
 }
 
-#slot-policies {
-    width: 2fr;
-    max-width: 48;
-}
-
 #controller-proof {
-    width: 3fr;
-    border-left: solid $panel;
+    border-bottom: solid $panel;
 }
 
 #event-log {
