@@ -20,6 +20,8 @@ from claude_swap.autoswitch import (
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
+    SharedProfileActivationEvent,
+    SharedProfileSafetyEvent,
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
@@ -89,6 +91,7 @@ class EngineHarness:
         self.engine = self._make_engine()
 
     def _make_engine(self, **kwargs) -> AutoSwitchEngine:
+        kwargs.setdefault("worker_admission_ready", lambda: True)
         return AutoSwitchEngine(
             self.switcher,
             self.settings,
@@ -462,6 +465,11 @@ class TestSharedProfileRotationController:
         root = harness.switcher.backup_dir
         primed = harness.switcher.switchable_account_numbers()
         set_setting(root, "autoswitch.sharedProfile.enabled", "true")
+        set_setting(
+            root,
+            "autoswitch.sharedProfile.rolloutStage",
+            "small-roster",
+        )
         set_slot_policy(
             root, 1, five_hour_ceiling_pct=90, weekly_ceiling_pct=80
         )
@@ -513,6 +521,410 @@ class TestSharedProfileRotationController:
                 "1970-01-13T00:20:00Z",
             ),
         }
+
+    def test_contract_gate_blocks_before_usage_or_activation(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.rolloutStage",
+            "contract",
+        )
+
+        with patch.object(h.switcher, "usage_entries_by_account") as collect:
+            assert h.engine.tick() is TickOutcome.BLOCKED
+
+        collect.assert_not_called()
+        assert h.active_number() == 1
+        event = next(
+            event
+            for event in h.events
+            if isinstance(event, SharedProfileSafetyEvent)
+        )
+        assert event.reason == "rollout-contract"
+        assert event.rollout_stage == "contract"
+
+    def test_live_gate_blocks_when_worker_admission_is_unavailable(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.engine = h._make_engine(worker_admission_ready=lambda: False)
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        blocked = h.state()["sharedProfileController"]
+        assert blocked["phase"] == "verification-blocked"
+        assert blocked["reason"] == "worker-admission-hold-unavailable"
+        assert blocked["manualReconciliationRequired"] is True
+
+    def test_worker_admission_probe_failure_is_an_unavailable_hold(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+
+        def unreachable():
+            raise OSError("admission endpoint unreachable")
+
+        h.engine = h._make_engine(worker_admission_ready=unreachable)
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert (
+            h.state()["sharedProfileController"]["reason"]
+            == "worker-admission-hold-unavailable"
+        )
+
+    def test_canary_gate_refuses_more_than_one_rotating_seat(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.rolloutStage",
+            "canary",
+        )
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        event = next(
+            event
+            for event in h.events
+            if isinstance(event, SharedProfileSafetyEvent)
+        )
+        assert event.reason == "canary-roster-scope"
+
+    def test_small_roster_gate_refuses_protected_seat_until_final_stage(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_slot_policy(
+            h.switcher.backup_dir,
+            2,
+            five_hour_ceiling_pct=50,
+            weekly_ceiling_pct=100,
+        )
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        event = next(
+            event
+            for event in h.events
+            if isinstance(event, SharedProfileSafetyEvent)
+        )
+        assert event.reason == "protected-seat-stage-required"
+
+    def test_small_roster_allows_owner_seat_with_lower_nonprotected_cap(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_slot_policy(
+            h.switcher.backup_dir,
+            2,
+            five_hour_ceiling_pct=80,
+            weekly_ceiling_pct=100,
+        )
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not any(
+            isinstance(event, SharedProfileSafetyEvent)
+            and event.reason == "protected-seat-stage-required"
+            for event in h.events
+        )
+
+    def test_shadow_gate_is_dry_run_only_and_never_needs_worker_admission(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.rolloutStage",
+            "shadow",
+        )
+        before = h.state()
+        readiness_checked = False
+
+        def admission():
+            nonlocal readiness_checked
+            readiness_checked = True
+            return False
+
+        h.engine = h._make_engine(
+            dry_run=True,
+            worker_admission_ready=admission,
+        )
+        usage = self._usage(active_five=90)
+        assert h.tick_with_usage(usage) in (
+            TickOutcome.NO_ACTION,
+            TickOutcome.SWITCHED,
+        )
+        assert readiness_checked is False
+        assert h.active_number() == 1
+        assert h.state() == before
+
+    def test_disabling_shared_actuation_holds_instead_of_falling_into_classic(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=50)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.manualHold",
+            "true",
+        )
+        h.tick_with_usage(self._usage())
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.enabled",
+            "false",
+        )
+        classic_would_switch = {
+            "1": _usage(95),
+            "2": _usage(10),
+        }
+
+        assert h.tick_with_usage(classic_would_switch) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert (
+            h.state()["sharedProfileController"]["reason"]
+            == "operator-manual-hold"
+        )
+
+    @pytest.mark.parametrize("phase", ["selecting", "verification-blocked"])
+    def test_restart_from_nonterminal_safety_phase_requires_manual_reconciliation(
+        self, temp_home, phase
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "sharedProfileController": {
+                        "phase": phase,
+                        "activeSlot": "1",
+                    },
+                }
+            )
+        )
+        h.engine = h._make_engine()
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        blocked = h.state()["sharedProfileController"]
+        assert blocked["phase"] == "verification-blocked"
+        assert blocked["manualReconciliationRequired"] is True
+
+    def test_corrupt_controller_state_blocks_without_overwriting_evidence(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        path.write_text("{truncated")
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert path.read_text() == "{truncated"
+
+    def test_explicit_reconcile_uses_fresh_poll_to_leave_blocked_state(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        state = h.state()
+        state["sharedProfileController"].update(
+            {
+                "phase": "verification-blocked",
+                "reason": "worker-admission-hold-unavailable",
+                "primedIdentities": {
+                    slot: h.switcher.account_identity(slot)
+                    for slot in ("1", "2")
+                },
+            }
+        )
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps(state)
+        )
+        h.engine = h._make_engine(manual_reconcile=True)
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        reconciled = h.state()["sharedProfileController"]
+        assert reconciled["phase"] == "steady"
+        assert reconciled["activeSlot"] == "1"
+        assert reconciled["controllerRevision"]
+
+    def test_malformed_priming_reset_cannot_become_five_hour_proof(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        malformed = self._usage()
+        malformed["1"]["five_hour"]["resets_at"] = "not-a-reset"
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            return_value=malformed["1"],
+        ):
+            assert h.tick_with_usage(malformed) is TickOutcome.BLOCKED
+
+        assert h.active_number() == 1
+        assert h.state() == {}
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            pytest.param(
+                lambda usage, now: UsageEntry(
+                    last_good=usage,
+                    fetched_at=now - 1,
+                    age_s=1,
+                ),
+                id="stale-prior-epoch",
+            ),
+            pytest.param(lambda usage, now: UsageEntry(), id="missing"),
+            pytest.param(
+                lambda usage, now: UsageEntry(
+                    last_good=usage,
+                    fetched_at=now,
+                    last_attempt_at=now,
+                    last_error="timeout",
+                    consecutive_failures=1,
+                ),
+                id="poll-failure",
+            ),
+            pytest.param(
+                lambda usage, now: UsageEntry(
+                    last_good=usage,
+                    fetched_at=now - 30,
+                    last_attempt_at=now - 1,
+                    last_error="http-429",
+                    backoff_until=now + 300,
+                    trust_extended=True,
+                ),
+                id="backoff-or-active-claim",
+            ),
+        ],
+    )
+    def test_unverified_observation_never_activates_or_parks(
+        self, temp_home, entry
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        usage = self._usage()
+        entries = {
+            slot: entry(value, h.clock.now)
+            for slot, value in usage.items()
+        }
+
+        with patch.object(h.switcher, "fetch_usage_now") as recheck:
+            assert h.tick_with_entries(entries) is TickOutcome.BLOCKED
+
+        recheck.assert_not_called()
+        assert h.active_number() == 1
+        controller = h.state()["sharedProfileController"]
+        assert controller["phase"] == "priming-complete"
+        assert "parkedSlot" not in controller
+
+    def test_rollout_settings_do_not_change_classic_mode_without_controller(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=50)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.rolloutStage",
+            "protected-seat",
+        )
+        usage = {"1": _usage(95), "2": _usage(10)}
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            return_value=usage["2"],
+        ):
+            assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+
+        assert h.active_number() == 2
+        assert not any(
+            isinstance(event, SharedProfileSafetyEvent) for event in h.events
+        )
+
+    def test_disabled_shared_mode_ignores_old_controller_without_manual_hold(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=50)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "sharedProfileController": {
+                        "phase": "verification-blocked",
+                    },
+                }
+            )
+        )
+        usage = {"1": _usage(95), "2": _usage(10)}
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            return_value=usage["2"],
+        ):
+            assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+
+        assert h.active_number() == 2
 
     def test_steady_state_survives_restart_and_releases_after_both_gates(
         self, temp_home
@@ -570,6 +982,34 @@ class TestSharedProfileRotationController:
         ):
             assert h.tick_with_usage(capped) is TickOutcome.SWITCHED
         assert h.active_number() == 2
+        proof = next(
+            event
+            for event in h.events
+            if isinstance(event, SharedProfileActivationEvent)
+        )
+        switch = next(
+            event for event in h.events if isinstance(event, SwitchEvent)
+        )
+        assert h.events.index(proof) < h.events.index(switch)
+        payload = proof.to_json()
+        assert payload["targetSlot"] == "2"
+        assert payload["activeSlot"] == "2"
+        assert payload["controllerState"] == "steady"
+        assert payload["trigger"] == "failover"
+        assert payload["strictlyEligible"] is True
+        assert payload["fiveHourPct"] < payload["fiveHourCeilingPct"]
+        assert payload["weeklyPct"] < payload["weeklyCeilingPct"]
+        assert payload["selectionEpoch"]
+        assert payload["prelockObservationRevision"]
+        assert payload["lockedObservationRevision"]
+        assert (
+            payload["prelockObservationRevision"]
+            != payload["lockedObservationRevision"]
+        )
+        controller = h.state()["sharedProfileController"]
+        assert payload["controllerRevision"] == controller["controllerRevision"]
+        assert payload["activeSlot"] == controller["activeSlot"]
+        assert payload["controllerState"] == controller["phase"]
 
     def test_priming_pending_state_remains_pinned_for_ticket_11(self, temp_home):
         h = EngineHarness(temp_home)

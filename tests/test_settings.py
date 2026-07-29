@@ -17,6 +17,7 @@ from claude_swap.settings import (
     SharedProfileSettings,
     UiSettings,
     effective_settings,
+    load_shared_profile_settings,
     load_settings,
     load_ui_settings,
     merged_with_cli,
@@ -175,6 +176,55 @@ class TestSettingSpecs:
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
+
+
+class TestSharedProfileRolloutSettings:
+    def test_rollout_stage_defaults_to_contract(self, tmp_path: Path):
+        assert load_shared_profile_settings(tmp_path).rollout_stage == "contract"
+
+    def test_rollout_stage_round_trips_through_strict_setting(self, tmp_path: Path):
+        assert (
+            set_setting(
+                tmp_path,
+                "autoswitch.sharedProfile.rolloutStage",
+                "small-roster",
+            )
+            == "small-roster"
+        )
+        assert (
+            load_shared_profile_settings(tmp_path).rollout_stage
+            == "small-roster"
+        )
+
+    def test_unknown_rollout_stage_is_rejected_fail_closed(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {
+                            "enabled": True,
+                            "rolloutStage": "full-send",
+                        }
+                    }
+                }
+            )
+        )
+        with pytest.raises(ConfigError, match="rolloutStage"):
+            load_shared_profile_settings(tmp_path)
+
+    def test_manual_hold_is_an_explicit_strict_rollback_gate(
+        self, tmp_path: Path
+    ):
+        assert load_shared_profile_settings(tmp_path).manual_hold is False
+        assert (
+            set_setting(
+                tmp_path,
+                "autoswitch.sharedProfile.manualHold",
+                "true",
+            )
+            is True
+        )
+        assert load_shared_profile_settings(tmp_path).manual_hold is True
 
 
 class TestSetUnsetSetting:
