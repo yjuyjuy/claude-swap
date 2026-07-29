@@ -1732,12 +1732,15 @@ class AutoSwitchEngine:
         shared: SharedProfileSettings,
         primed_slots: list[str],
         baseline_failures: int,
-        baseline_fetched_at: float,
+        baseline_fetched_at: float | None,
         expected_identities: dict[str, dict],
         current_email: str,
     ) -> TickOutcome:
         baseline = snapshot_usage.get(target)
-        if not self._verified_priming_baseline(baseline, policies[target]):
+        if (
+            baseline_fetched_at is None
+            or not self._verified_priming_baseline(baseline, policies[target])
+        ):
             self._emit(
                 NoSwitchEvent(
                     reason="priming-baseline-unavailable",
@@ -1999,7 +2002,7 @@ class AutoSwitchEngine:
                     if baseline_entry is not None
                     else 0
                 ),
-                baseline_fetched_at=fetched_at_by_slot[unprimed[0]],
+                baseline_fetched_at=fetched_at_by_slot.get(unprimed[0]),
                 expected_identities=identities,
                 current_email=current_email,
             )

@@ -1080,6 +1080,33 @@ class TestSharedProfileRotationController:
         assert pending["primedSlots"] == []
         assert h.active_number() == 1
 
+    def test_unprimed_slot_without_same_tick_proof_blocks_cleanly(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        usage = self._usage()
+        entries = {
+            "1": UsageEntry(
+                last_good=usage["1"],
+                fetched_at=h.clock.now - 1,
+                age_s=1,
+            ),
+            "2": _entry_for(usage["2"], h.clock.now),
+        }
+
+        assert h.tick_with_entries(entries) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert any(
+            isinstance(event, NoSwitchEvent)
+            and event.reason == "priming-baseline-unavailable"
+            for event in h.events
+        )
+
     def test_priming_order_activates_higher_priority_slot_with_locked_baseline(
         self, temp_home
     ):
