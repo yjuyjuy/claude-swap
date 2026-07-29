@@ -598,11 +598,11 @@ class AutoSwitchEngine:
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
-        # Ticket #12 deliberately ships no Firstmate integration. Production
-        # therefore has no way to prove durable worker admission and remains
-        # held. Tests may inject a proof boundary to exercise controller
-        # behavior without inventing queue ownership here.
-        self._worker_admission_ready = worker_admission_ready or (lambda: False)
+        # This deployment's shared queue runs continuously and self-wakes, so
+        # there is no pause/ack admission protocol to wait for. An integration
+        # may still inject an explicit readiness probe; its False/error result
+        # retains the fail-closed hold.
+        self._worker_admission_ready = worker_admission_ready or (lambda: True)
         self._manual_reconcile = manual_reconcile
         self._stop = threading.Event()
         # Cuts the current inter-tick sleep short (a session threshold change

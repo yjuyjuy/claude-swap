@@ -584,6 +584,35 @@ class TestSharedProfileRotationController:
         assert blocked["reason"] == "worker-admission-hold-unavailable"
         assert blocked["manualReconciliationRequired"] is True
 
+    def test_continuous_queue_defaults_worker_admission_ready(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("b@example.com", 2)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        h.engine = AutoSwitchEngine(
+            h.switcher,
+            h.settings,
+            h.events.append,
+            clock=h.clock,
+        )
+        usage = self._usage()
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=lambda slot: usage[slot],
+        ):
+            assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+
+        controller = h.state()["sharedProfileController"]
+        assert controller["phase"] == "priming-pending"
+        assert controller["activeSlot"] == "1"
+        assert h.active_number() == 1
+
     def test_worker_admission_probe_failure_is_an_unavailable_hold(
         self, temp_home
     ):
