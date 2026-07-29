@@ -718,6 +718,22 @@ class ClaudeAccountSwitcher:
         ]
         return sorted(rows, key=lambda r: int(r[0]))
 
+    def slot_roster(self) -> dict[int, str]:
+        """Return current occupied slot numbers without mutating roster data."""
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        if not isinstance(accounts, dict):
+            return {}
+        roster: dict[int, str] = {}
+        for raw_slot, record in accounts.items():
+            try:
+                slot = int(raw_slot)
+            except (TypeError, ValueError):
+                continue
+            if slot >= 1 and isinstance(record, dict):
+                roster[slot] = str(record.get("email", ""))
+        return roster
+
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two accounts' slot numbers (list order / numeric targets).
 
@@ -1364,7 +1380,11 @@ class ClaudeAccountSwitcher:
         return self._usage_by_account()
 
     def usage_entries_by_account(
-        self, fetch: set[str] | None = None, *, scheduled: bool = False
+        self,
+        fetch: set[str] | None = None,
+        *,
+        scheduled: bool = False,
+        force: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage entries (ages, errors, poll state) per account.
 
@@ -1372,11 +1392,38 @@ class ClaudeAccountSwitcher:
         auto engine's scheduler); ``None`` means every stale account is
         eligible (on-demand callers). ``scheduled=True`` preserves valid
         future plans while still allowing due plans to beat the serve TTL.
+        ``force`` obtains same-epoch proof for safety-critical decisions
+        while retaining claim/backoff guards.
         """
         accounts_info = self._build_accounts_info()
         return self._collect_usage_entries(
-            accounts_info, fetch=fetch, scheduled=scheduled
+            accounts_info,
+            fetch=fetch,
+            scheduled=scheduled,
+            force=force,
         )
+
+    def fetch_usage_now(self, account_num: str) -> dict | None:
+        """Fetch one slot directly for a lock-held activation recheck.
+
+        This intentionally does not serve the usage cache: callers use it only
+        after nominating a target from a selection snapshot and need a new
+        provider observation before changing shared-profile rotation.
+        """
+        info = next(
+            (
+                item
+                for item in self._build_accounts_info()
+                if str(item[0]) == str(account_num)
+            ),
+            None,
+        )
+        if info is None:
+            return None
+        record = self._fetch_account_usage(info)
+        if record.error is not None or record.sentinel is not None:
+            return None
+        return record.usage if isinstance(record.usage, dict) else None
 
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
@@ -3399,6 +3446,7 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        force: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -3454,6 +3502,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=True,
                 repair_overslept=True,
+                force=force,
             )
         else:
             claims = store.reserve(
@@ -3461,6 +3510,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=False,
                 repair_overslept=scheduled,
+                force=force,
             )
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent

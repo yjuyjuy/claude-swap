@@ -20,6 +20,8 @@ from claude_swap.autoswitch import (
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
+    SharedProfileActivationEvent,
+    SharedProfileSafetyEvent,
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
@@ -28,7 +30,7 @@ from claude_swap.autoswitch import (
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, set_setting, set_slot_policy
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -48,6 +50,18 @@ def _usage(pct: float, resets_at: str | None = None) -> dict:
     if resets_at:
         window["resets_at"] = resets_at
     return {"five_hour": window, "seven_day": {"pct": 0.0}}
+
+
+def _paced_usage(
+    five: float,
+    weekly: float,
+    five_reset: str,
+    weekly_reset: str,
+) -> dict:
+    return {
+        "five_hour": {"pct": five, "resets_at": five_reset},
+        "seven_day": {"pct": weekly, "resets_at": weekly_reset},
+    }
 
 
 def _entry_for(value: dict | str | None, now: float) -> UsageEntry:
@@ -77,6 +91,7 @@ class EngineHarness:
         self.engine = self._make_engine()
 
     def _make_engine(self, **kwargs) -> AutoSwitchEngine:
+        kwargs.setdefault("worker_admission_ready", lambda: True)
         return AutoSwitchEngine(
             self.switcher,
             self.settings,
@@ -459,6 +474,1030 @@ class TestDecisionTable:
         assert event.earliest_reset_at is None
         assert harness.engine._sleep_until_ts is None
         assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
+
+
+class TestSharedProfileRotationController:
+    _FIVE_RESET = "2026-08-01T00:00:00Z"
+    _WEEKLY_SOON = "1970-01-13T00:00:00Z"
+    _WEEKLY_LATER = "1970-01-14T00:00:00Z"
+
+    def _enable(self, harness: EngineHarness) -> None:
+        root = harness.switcher.backup_dir
+        primed = harness.switcher.switchable_account_numbers()
+        set_setting(root, "autoswitch.sharedProfile.enabled", "true")
+        set_setting(
+            root,
+            "autoswitch.sharedProfile.rolloutStage",
+            "small-roster",
+        )
+        set_slot_policy(
+            root, 1, five_hour_ceiling_pct=90, weekly_ceiling_pct=80
+        )
+        set_slot_policy(
+            root, 2, five_hour_ceiling_pct=90, weekly_ceiling_pct=100
+        )
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "sharedProfileController": {
+                        "phase": "priming-complete",
+                        "primedSlots": primed,
+                    },
+                }
+            )
+        )
+
+    def _usage(self, *, active_five: float = 10, active_weekly: float = 20):
+        return {
+            "1": _paced_usage(
+                active_five,
+                active_weekly,
+                self._FIVE_RESET,
+                self._WEEKLY_LATER,
+            ),
+            "2": _paced_usage(
+                10,
+                20,
+                self._FIVE_RESET,
+                self._WEEKLY_SOON,
+            ),
+        }
+
+    @staticmethod
+    def _capped_usage() -> dict:
+        return {
+            "1": _paced_usage(
+                90,
+                20,
+                "1970-01-13T00:10:00Z",
+                "1970-01-14T00:00:00Z",
+            ),
+            "2": _paced_usage(
+                10,
+                100,
+                "1970-01-13T00:00:00Z",
+                "1970-01-13T00:20:00Z",
+            ),
+        }
+
+    def test_contract_gate_blocks_before_usage_or_activation(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.rolloutStage",
+            "contract",
+        )
+
+        with patch.object(h.switcher, "usage_entries_by_account") as collect:
+            assert h.engine.tick() is TickOutcome.BLOCKED
+
+        collect.assert_not_called()
+        assert h.active_number() == 1
+        event = next(
+            event
+            for event in h.events
+            if isinstance(event, SharedProfileSafetyEvent)
+        )
+        assert event.reason == "rollout-contract"
+        assert event.rollout_stage == "contract"
+
+    def test_live_gate_blocks_when_worker_admission_is_unavailable(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.engine = h._make_engine(worker_admission_ready=lambda: False)
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        blocked = h.state()["sharedProfileController"]
+        assert blocked["phase"] == "verification-blocked"
+        assert blocked["reason"] == "worker-admission-hold-unavailable"
+        assert blocked["manualReconciliationRequired"] is True
+
+    def test_continuous_queue_defaults_worker_admission_ready(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("b@example.com", 2)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        h.engine = AutoSwitchEngine(
+            h.switcher,
+            h.settings,
+            h.events.append,
+            clock=h.clock,
+        )
+        usage = self._usage()
+        del usage["1"]["five_hour"]["resets_at"]
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=lambda slot: usage[slot],
+        ):
+            assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+
+        controller = h.state()["sharedProfileController"]
+        assert controller["phase"] == "priming-pending"
+        assert controller["activeSlot"] == "1"
+        assert h.active_number() == 1
+
+    def test_worker_admission_probe_failure_is_an_unavailable_hold(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+
+        def unreachable():
+            raise OSError("admission endpoint unreachable")
+
+        h.engine = h._make_engine(worker_admission_ready=unreachable)
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert (
+            h.state()["sharedProfileController"]["reason"]
+            == "worker-admission-hold-unavailable"
+        )
+
+    def test_canary_gate_refuses_more_than_one_rotating_seat(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.rolloutStage",
+            "canary",
+        )
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        event = next(
+            event
+            for event in h.events
+            if isinstance(event, SharedProfileSafetyEvent)
+        )
+        assert event.reason == "canary-roster-scope"
+
+    def test_small_roster_gate_refuses_protected_seat_until_final_stage(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_slot_policy(
+            h.switcher.backup_dir,
+            2,
+            five_hour_ceiling_pct=50,
+            weekly_ceiling_pct=100,
+        )
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        event = next(
+            event
+            for event in h.events
+            if isinstance(event, SharedProfileSafetyEvent)
+        )
+        assert event.reason == "protected-seat-stage-required"
+
+    def test_small_roster_allows_owner_seat_with_lower_nonprotected_cap(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_slot_policy(
+            h.switcher.backup_dir,
+            2,
+            five_hour_ceiling_pct=80,
+            weekly_ceiling_pct=100,
+        )
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not any(
+            isinstance(event, SharedProfileSafetyEvent)
+            and event.reason == "protected-seat-stage-required"
+            for event in h.events
+        )
+
+    def test_shadow_gate_is_dry_run_only_and_never_needs_worker_admission(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.rolloutStage",
+            "shadow",
+        )
+        before = h.state()
+        readiness_checked = False
+
+        def admission():
+            nonlocal readiness_checked
+            readiness_checked = True
+            return False
+
+        h.engine = h._make_engine(
+            dry_run=True,
+            worker_admission_ready=admission,
+        )
+        usage = self._usage(active_five=90)
+        assert h.tick_with_usage(usage) in (
+            TickOutcome.NO_ACTION,
+            TickOutcome.SWITCHED,
+        )
+        assert readiness_checked is False
+        assert h.active_number() == 1
+        assert h.state() == before
+
+    def test_disabling_shared_actuation_holds_instead_of_falling_into_classic(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=50)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.manualHold",
+            "true",
+        )
+        h.tick_with_usage(self._usage())
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.enabled",
+            "false",
+        )
+        classic_would_switch = {
+            "1": _usage(95),
+            "2": _usage(10),
+        }
+
+        assert h.tick_with_usage(classic_would_switch) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert (
+            h.state()["sharedProfileController"]["reason"]
+            == "operator-manual-hold"
+        )
+
+    @pytest.mark.parametrize("phase", ["selecting", "verification-blocked"])
+    def test_restart_from_nonterminal_safety_phase_requires_manual_reconciliation(
+        self, temp_home, phase
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "sharedProfileController": {
+                        "phase": phase,
+                        "activeSlot": "1",
+                    },
+                }
+            )
+        )
+        h.engine = h._make_engine()
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        blocked = h.state()["sharedProfileController"]
+        assert blocked["phase"] == "verification-blocked"
+        assert blocked["manualReconciliationRequired"] is True
+
+    def test_corrupt_controller_state_blocks_without_overwriting_evidence(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        path.write_text("{truncated")
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert path.read_text() == "{truncated"
+
+    def test_explicit_reconcile_uses_fresh_poll_to_leave_blocked_state(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        state = h.state()
+        state["sharedProfileController"].update(
+            {
+                "phase": "verification-blocked",
+                "reason": "worker-admission-hold-unavailable",
+                "primedIdentities": {
+                    slot: h.switcher.account_identity(slot)
+                    for slot in ("1", "2")
+                },
+            }
+        )
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps(state)
+        )
+        h.engine = h._make_engine(manual_reconcile=True)
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        reconciled = h.state()["sharedProfileController"]
+        assert reconciled["phase"] == "steady"
+        assert reconciled["activeSlot"] == "1"
+        assert reconciled["controllerRevision"]
+
+    def test_malformed_priming_reset_cannot_become_five_hour_proof(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        malformed = self._usage()
+        malformed["1"]["five_hour"]["resets_at"] = "not-a-reset"
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            return_value=malformed["1"],
+        ):
+            assert h.tick_with_usage(malformed) is TickOutcome.BLOCKED
+
+        assert h.active_number() == 1
+        assert h.state() == {}
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            pytest.param(
+                lambda usage, now: UsageEntry(
+                    last_good=usage,
+                    fetched_at=now - 1,
+                    age_s=1,
+                ),
+                id="stale-prior-epoch",
+            ),
+            pytest.param(lambda usage, now: UsageEntry(), id="missing"),
+            pytest.param(
+                lambda usage, now: UsageEntry(
+                    last_good=usage,
+                    fetched_at=now,
+                    last_attempt_at=now,
+                    last_error="timeout",
+                    consecutive_failures=1,
+                ),
+                id="poll-failure",
+            ),
+            pytest.param(
+                lambda usage, now: UsageEntry(
+                    last_good=usage,
+                    fetched_at=now - 30,
+                    last_attempt_at=now - 1,
+                    last_error="http-429",
+                    backoff_until=now + 300,
+                    trust_extended=True,
+                ),
+                id="backoff-or-active-claim",
+            ),
+        ],
+    )
+    def test_unverified_observation_never_activates_or_parks(
+        self, temp_home, entry
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        usage = self._usage()
+        entries = {
+            slot: entry(value, h.clock.now)
+            for slot, value in usage.items()
+        }
+
+        with patch.object(h.switcher, "fetch_usage_now") as recheck:
+            assert h.tick_with_entries(entries) is TickOutcome.BLOCKED
+
+        recheck.assert_not_called()
+        assert h.active_number() == 1
+        controller = h.state()["sharedProfileController"]
+        assert controller["phase"] == "priming-complete"
+        assert "parkedSlot" not in controller
+
+    def test_rollout_settings_do_not_change_classic_mode_without_controller(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=50)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        set_setting(
+            h.switcher.backup_dir,
+            "autoswitch.sharedProfile.rolloutStage",
+            "protected-seat",
+        )
+        usage = {"1": _usage(95), "2": _usage(10)}
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            return_value=usage["2"],
+        ):
+            assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+
+        assert h.active_number() == 2
+        assert not any(
+            isinstance(event, SharedProfileSafetyEvent) for event in h.events
+        )
+
+    def test_disabled_shared_mode_ignores_old_controller_without_manual_hold(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=50)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "sharedProfileController": {
+                        "phase": "verification-blocked",
+                    },
+                }
+            )
+        )
+        usage = {"1": _usage(95), "2": _usage(10)}
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            return_value=usage["2"],
+        ):
+            assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+
+        assert h.active_number() == 2
+
+    def test_steady_state_survives_restart_and_releases_after_both_gates(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        steady = h.state()["sharedProfileController"]
+        assert steady["phase"] == "steady"
+        assert steady["activeSlot"] == "1"
+
+        h.clock.advance(900)
+        h.engine = h._make_engine()
+        changed = self._usage(active_five=11)
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=lambda slot: changed[slot],
+        ):
+            assert h.tick_with_usage(changed) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.state()["sharedProfileController"]["activeSlot"] == "2"
+
+    def test_clock_only_rank_change_does_not_release_active_slot(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        usage = self._usage()
+
+        h.tick_with_usage(usage)
+        h.clock.advance(900)
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_active_at_ceiling_fails_over_immediately(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.tick_with_usage(self._usage())
+
+        capped = self._usage(active_five=90)
+        h.clock.advance(1)
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=lambda slot: capped[slot],
+        ):
+            assert h.tick_with_usage(capped) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        proof = next(
+            event
+            for event in h.events
+            if isinstance(event, SharedProfileActivationEvent)
+        )
+        switch = next(
+            event for event in h.events if isinstance(event, SwitchEvent)
+        )
+        assert h.events.index(proof) < h.events.index(switch)
+        payload = proof.to_json()
+        assert payload["targetSlot"] == "2"
+        assert payload["activeSlot"] == "2"
+        assert payload["controllerState"] == "steady"
+        assert payload["trigger"] == "failover"
+        assert payload["strictlyEligible"] is True
+        assert payload["fiveHourPct"] < payload["fiveHourCeilingPct"]
+        assert payload["weeklyPct"] < payload["weeklyCeilingPct"]
+        assert payload["selectionEpoch"]
+        assert payload["prelockObservationRevision"]
+        assert payload["lockedObservationRevision"]
+        assert (
+            payload["prelockObservationRevision"]
+            != payload["lockedObservationRevision"]
+        )
+        controller = h.state()["sharedProfileController"]
+        assert payload["controllerRevision"] == controller["controllerRevision"]
+        assert payload["activeSlot"] == controller["activeSlot"]
+        assert payload["controllerState"] == controller["phase"]
+
+    def test_priming_pending_state_remains_pinned_for_ticket_11(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.switcher.backup_dir.mkdir(parents=True, exist_ok=True)
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "sharedProfileController": {
+                        "phase": "priming-pending",
+                        "activeSlot": "1",
+                    },
+                }
+            )
+        )
+
+        with patch.object(h.switcher, "fetch_usage_now") as recheck:
+            assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        recheck.assert_not_called()
+        assert h.active_number() == 1
+
+    def test_unprimed_priority_slot_persists_baseline_and_activation_pin(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        usage = self._usage()
+        del usage["1"]["five_hour"]["resets_at"]
+
+        entries = {
+            num: _entry_for(value, h.clock.now)
+            for num, value in usage.items()
+        }
+        with (
+            patch.object(
+                h.switcher,
+                "usage_entries_by_account",
+                return_value=entries,
+            ) as collect,
+            patch.object(
+                h.switcher, "fetch_usage_now", return_value=usage["1"]
+            ) as recheck,
+        ):
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+
+        collect.assert_called_once_with(fetch={"1", "2"}, force=True)
+        recheck.assert_called_once_with("1")
+        pending = h.state()["sharedProfileController"]
+        assert pending["phase"] == "priming-pending"
+        assert pending["activeSlot"] == "1"
+        assert pending["baselineFiveHourResetAt"] is None
+        assert pending["activatedAt"] == h.clock.now
+        assert pending["primedSlots"] == ["2"]
+        assert h.active_number() == 1
+
+    def test_open_five_hour_windows_are_primed_without_controller_state(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("b@example.com", 2)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        usage = self._usage()
+
+        with patch.object(h.switcher, "fetch_usage_now") as recheck:
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+
+        recheck.assert_not_called()
+        controller = h.state()["sharedProfileController"]
+        assert controller["phase"] == "steady"
+        assert controller["activeSlot"] == "2"
+        assert controller["primedSlots"] == ["1", "2"]
+        assert h.switcher.current_account_number() == "2"
+
+    def test_same_tick_gap_does_not_crash_priming_derivation(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        usage = self._usage()
+        entries = {
+            "1": UsageEntry(
+                last_good=usage["1"],
+                fetched_at=h.clock.now - 1,
+                age_s=1,
+            ),
+            "2": _entry_for(usage["2"], h.clock.now),
+        }
+
+        with patch.object(h.switcher, "fetch_usage_now", return_value=None):
+            assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not any(isinstance(event, ErrorEvent) for event in h.events)
+
+    def test_priming_order_activates_higher_priority_slot_with_locked_baseline(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        set_slot_policy(
+            h.switcher.backup_dir,
+            2,
+            five_hour_ceiling_pct=90,
+            weekly_ceiling_pct=100,
+            priority=10,
+        )
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        usage = self._usage()
+        del usage["2"]["five_hour"]["resets_at"]
+        locked = usage["2"]
+
+        with patch.object(
+            h.switcher, "fetch_usage_now", return_value=locked
+        ) as recheck:
+            assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+
+        recheck.assert_called_once_with("2")
+        pending = h.state()["sharedProfileController"]
+        assert pending["phase"] == "priming-pending"
+        assert pending["activeSlot"] == "2"
+        assert pending["baselineFiveHourResetAt"] is None
+        assert h.active_number() == 2
+
+    def test_priming_restart_polls_only_pin_until_reset_advances(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        baseline = self._usage()
+        del baseline["1"]["five_hour"]["resets_at"]
+        with patch.object(
+            h.switcher, "fetch_usage_now", return_value=baseline["1"]
+        ):
+            h.tick_with_usage(baseline)
+        h.clock.advance(1)
+        h.engine = h._make_engine()
+
+        equal_entries = {
+            "1": _entry_for(baseline["1"], h.clock.now),
+            "2": _entry_for(baseline["2"], h.clock.now),
+        }
+        with patch.object(
+            h.switcher,
+            "usage_entries_by_account",
+            return_value=equal_entries,
+        ) as collect:
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+        collect.assert_called_once_with(fetch={"1"})
+        assert h.state()["sharedProfileController"]["phase"] == "priming-pending"
+        assert h.active_number() == 1
+
+        h.clock.advance(1)
+        advanced = self._usage()
+        advanced["1"]["five_hour"]["resets_at"] = "2026-08-01T01:00:00Z"
+        with patch.object(
+            h.switcher,
+            "usage_entries_by_account",
+            return_value={"1": _entry_for(advanced["1"], h.clock.now)},
+        ):
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+        controller = h.state()["sharedProfileController"]
+        assert controller["phase"] == "priming"
+        assert controller["primedSlots"] == ["1"]
+        assert h.active_number() == 1
+
+    def test_first_reset_is_new_proof_for_unopened_baseline(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        baseline = self._usage()
+        del baseline["1"]["five_hour"]["resets_at"]
+        with patch.object(
+            h.switcher, "fetch_usage_now", return_value=baseline["1"]
+        ):
+            assert h.tick_with_usage(baseline) is TickOutcome.NO_ACTION
+        assert (
+            h.state()["sharedProfileController"]["baselineFiveHourResetAt"]
+            is None
+        )
+
+        h.clock.advance(1)
+        opened = self._usage()
+        with patch.object(
+            h.switcher,
+            "usage_entries_by_account",
+            return_value={"1": _entry_for(opened["1"], h.clock.now)},
+        ):
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+        assert h.state()["sharedProfileController"]["primedSlots"] == ["1"]
+
+    def test_priming_failed_polls_escalate_without_releasing_pin(self, temp_home):
+        h = EngineHarness(temp_home, unhealthy_ticks=2)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        (h.switcher.backup_dir / "autoswitch_state.json").unlink()
+        baseline = self._usage()
+        del baseline["1"]["five_hour"]["resets_at"]
+        with patch.object(
+            h.switcher, "fetch_usage_now", return_value=baseline["1"]
+        ):
+            h.tick_with_usage(baseline)
+        h.clock.advance(1)
+
+        failed = UsageEntry(
+            last_attempt_at=h.clock.now,
+            consecutive_failures=1,
+            last_error="timeout",
+        )
+        with patch.object(
+            h.switcher,
+            "usage_entries_by_account",
+            return_value={"1": failed},
+        ):
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+        h.clock.advance(1)
+        failed = UsageEntry(
+            last_attempt_at=h.clock.now,
+            consecutive_failures=2,
+            last_error="timeout",
+        )
+        with patch.object(
+            h.switcher,
+            "usage_entries_by_account",
+            return_value={"1": failed},
+        ):
+            assert h.engine.tick() is TickOutcome.ERROR
+        pending = h.state()["sharedProfileController"]
+        assert pending["phase"] == "priming-pending"
+        assert pending["failedPolls"] == 2
+        assert pending["escalated"] is True
+        assert h.active_number() == 1
+
+    def test_all_capped_blocks_on_missing_worker_hold_without_parking(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        capped = self._capped_usage()
+
+        assert h.tick_with_usage(capped) is TickOutcome.BLOCKED
+
+        blocked = h.state()["sharedProfileController"]
+        assert blocked["phase"] == "verification-blocked"
+        assert blocked["reason"] == "worker-admission-hold-unavailable"
+        assert blocked["allCapped"] is True
+        assert blocked["proposedParkSlot"] == "1"
+        assert "parkedSlot" not in blocked
+        assert blocked["wakeAt"] == 1_037_460
+        assert h.active_number() == 1
+        hold = next(
+            event
+            for event in h.events
+            if isinstance(event, NoSwitchEvent)
+            and event.reason == "worker-admission-hold-unavailable"
+        )
+        assert "retaining rotating seat 1" in hold.detail
+
+    def test_all_capped_with_missing_reset_stays_on_bounded_blocked_retry(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        capped = self._capped_usage()
+        del capped["1"]["five_hour"]["resets_at"]
+
+        assert h.tick_with_usage(capped) is TickOutcome.BLOCKED
+
+        assert h.state()["sharedProfileController"]["wakeAt"] is None
+        assert h.engine._sleep_until_ts is None
+        assert h.active_number() == 1
+
+    def test_malformed_window_cannot_be_misreported_as_all_capped(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        malformed = self._capped_usage()
+        del malformed["1"]["five_hour"]["resets_at"]
+        malformed["1"]["seven_day"] = {"pct": "bad"}
+
+        assert h.tick_with_usage(malformed) is TickOutcome.BLOCKED
+
+        reasons = [
+            event.reason
+            for event in h.events
+            if isinstance(event, NoSwitchEvent)
+        ]
+        assert reasons == ["verification-blocked"]
+        assert h.active_number() == 1
+
+    def test_locked_recheck_loss_aborts_without_stale_fallback(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.tick_with_usage(self._usage())
+        h.clock.advance(900)
+        changed = self._usage(active_five=11)
+        target_at_ceiling = dict(changed["2"])
+        target_at_ceiling["five_hour"] = {
+            **changed["2"]["five_hour"],
+            "pct": 90,
+        }
+        selecting_states = []
+
+        def locked_usage(slot):
+            selecting_states.append(h.state()["sharedProfileController"])
+            return target_at_ceiling if slot == "2" else changed[slot]
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=locked_usage,
+        ):
+            assert h.tick_with_usage(changed) is TickOutcome.NO_ACTION
+        assert selecting_states
+        assert all(state["phase"] == "selecting" for state in selecting_states)
+        assert all(state["snapshotRevision"] for state in selecting_states)
+        assert h.active_number() == 1
+        assert h.state()["sharedProfileController"]["activeSlot"] == "1"
+
+    def test_quarantined_active_fails_over_without_dwell(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.tick_with_usage(self._usage())
+        state = h.state()
+        state["quarantine"] = {"1": {"email": "a@example.com"}}
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps(state)
+        )
+
+        usage = self._usage()
+        with (
+            patch.object(h.engine, "_release_recovered_quarantines", return_value=state),
+            patch.object(
+                h.switcher,
+                "fetch_usage_now",
+                side_effect=lambda slot: usage[slot],
+            ),
+        ):
+            assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_locked_active_reset_change_revokes_material_usage_proof(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        h.tick_with_usage(self._usage())
+        h.clock.advance(900)
+        changed = self._usage(active_five=11)
+        reset_changed = self._usage(active_five=12)
+        reset_changed["1"]["five_hour"]["resets_at"] = "2026-08-01T01:00:00Z"
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=lambda slot: (
+                reset_changed["1"] if slot == "1" else changed["2"]
+            ),
+        ) as fetch:
+            assert h.tick_with_usage(changed) is TickOutcome.NO_ACTION
+        assert [call.args[0] for call in fetch.call_args_list] == ["1", "2"]
+        assert h.active_number() == 1
+
+    def test_locked_target_must_remain_the_paced_winner(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._enable(h)
+        usage = self._usage()
+        usage["3"] = _paced_usage(
+            10,
+            20,
+            self._FIVE_RESET,
+            self._WEEKLY_LATER,
+        )
+        h.tick_with_usage(usage)
+        h.clock.advance(900)
+        usage["1"]["five_hour"]["pct"] = 11
+        target_slows = _paced_usage(
+            10,
+            99.9,
+            self._FIVE_RESET,
+            self._WEEKLY_SOON,
+        )
+
+        with patch.object(
+            h.switcher,
+            "fetch_usage_now",
+            side_effect=lambda slot: (
+                target_slows if slot == "2" else usage[slot]
+            ),
+        ):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
 
 
 class TestIdleHold:
@@ -2451,3 +3490,124 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+class TestPerWindowThresholds:
+    """--5h-threshold / --7d-threshold overrides, consume-first 5h-only
+    landing with 7d deprioritization, and the 99% proactive escape."""
+
+    def _h(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_consume_first_lands_on_7d_heavy_when_5h_is_free(self, temp_home):
+        # Example B: active 5h-bound; only viable peer has an empty 5h but a
+        # near-maxed 7d. The 5h-only landing gate lets it in (7d never blocks
+        # a consume-first landing), so the 5h pressure is relieved.
+        h = self._h(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 40, _R_LATER),
+            "2": _usage7(5, 92, _R_SOON),
+            "3": _usage7(95, 10, _R_LATEST),   # 5h over threshold -> not a landing
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_best_still_rejects_7d_heavy_landing(self, temp_home):
+        # Same shape as above but strategy=best: the max-fold landing gate is
+        # unchanged, so the 7d-heavy peer is rejected and best holds.
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 40, _R_LATER),
+            "2": _usage7(5, 92, _R_SOON),
+            "3": _usage7(95, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["no-qualifying-candidate"]
+
+    def test_7d_heavy_candidate_is_deprioritized_below_lighter(self, temp_home):
+        # Example D: with --7d-threshold 80, a sooner-resetting but 7d-heavy
+        # peer sinks below a later-resetting light peer.
+        h = self._h(temp_home, seven_day_threshold=80.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(10, 85, _R_SOON),     # 7d-heavy -> deprioritized
+            "3": _usage7(30, 50, _R_LATEST),   # lighter -> wins despite later
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_all_7d_heavy_still_switches_by_soonest(self, temp_home):
+        # Example E: every peer is 7d-heavy, so deprioritization can't break
+        # the tie; the soonest-resetting one is taken (fallback, 5h relief).
+        h = self._h(temp_home, seven_day_threshold=80.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 10, _R_LATER),
+            "2": _usage7(10, 85, _R_LATEST),
+            "3": _usage7(5, 90, _R_SOON),      # soonest among the heavy -> wins
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_7d_threshold_triggers_while_5h_is_healthy(self, temp_home):
+        # Example F: --7d-threshold 70 fires a weekly-driven switch even though
+        # the 5h window is well under the shared threshold.
+        h = self._h(temp_home, seven_day_threshold=70.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(40, 75, _R_LATER),    # 7d 75 >= 70 -> over threshold
+            "2": _usage7(10, 20, _R_SOON),
+            "3": _usage7(10, 20, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_7d_healthy_holds_without_override(self, temp_home):
+        # Control for the previous test: without the override the same usage is
+        # below threshold on every window, and the active resets soonest, so
+        # consume-first holds.
+        h = self._h(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(40, 75, _R_SOON),
+            "2": _usage7(10, 20, _R_LATER),
+            "3": _usage7(10, 20, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_escape_switches_when_active_critical_and_no_landing(self, temp_home):
+        # Example G: active >= the 99% escape line, every peer fails the normal
+        # 5h landing gate, so the wedge-breaker takes the best live account.
+        h = self._h(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(99.5, 20, _R_LATER),
+            "2": _usage7(95, 30, _R_SOON),     # over gate but more headroom
+            "3": _usage7(98, 30, _R_LATEST),   # over gate, less headroom
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+
+    def test_no_escape_below_99(self, temp_home):
+        # The escape has a floor: at 95% (over threshold but under the escape
+        # line) with no qualifying landing, the tick holds rather than taking
+        # an over-threshold peer.
+        h = self._h(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(92, 30, _R_SOON),
+            "3": _usage7(93, 30, _R_LATEST),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)

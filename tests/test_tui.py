@@ -1275,6 +1275,535 @@ def fake_calls(app) -> list[tuple]:
     return app.switcher.calls
 
 
+class TestSharedProfileObservability:
+    def test_policy_rows_show_source_fresh_usage_and_eligibility(self, tmp_path):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {
+                            "1": {
+                                "fiveHourCeilingPct": 90,
+                                "weeklyCeilingPct": 100,
+                                "priority": 30,
+                            },
+                            "3": {
+                                "fiveHourCeilingPct": 50,
+                                "weeklyCeilingPct": 100,
+                                "priority": 10,
+                            },
+                        },
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
+                make_account(1, active=True, entry=make_entry(42, 31, age_s=5)),
+                make_account(2, entry=make_entry(61, 52, age_s=5)),
+            ),
+            taken_at=time.time(),
+        )
+
+        view = shared_profile_observability(
+            snap, tmp_path, now=time.time(), unhealthy_ticks=3
+        )
+
+        assert view.enabled is True
+        plain = view.policies.plain
+        assert "CLI writes · TUI observes" in plain
+        assert "1" in plain and "42/90%" in plain
+        assert "explicit" in plain and "eligible · fresh" in plain
+        assert "2" in plain and "61/90%" in plain
+        assert "defaulted" in plain
+        assert "3" in plain and "vacant" in plain
+        assert "—/50%" in plain and "pri 10" in plain
+
+    def test_policy_rows_explain_capped_stale_and_failed_proof(self, tmp_path):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {
+                            "1": {"fiveHourCeilingPct": 50},
+                            "2": {"fiveHourCeilingPct": 90},
+                            "3": {"fiveHourCeilingPct": 90},
+                        },
+                    }
+                }
+            )
+        )
+        failed = dataclasses.replace(
+            make_entry(25, 10, age_s=5),
+            last_error="http-429",
+            backoff_until=time.time() + 60,
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
+                make_account(1, active=True, entry=make_entry(50, 20, age_s=5)),
+                make_account(2, entry=make_entry(30, 20, age_s=400)),
+                make_account(3, entry=failed),
+            ),
+            taken_at=time.time(),
+        )
+
+        plain = shared_profile_observability(
+            snap, tmp_path, now=time.time(), unhealthy_ticks=3
+        ).policies.plain
+
+        assert "5h capped" in plain
+        assert "stale proof 6m" in plain
+        assert "poll failed: http-429" in plain
+
+    def test_policy_rows_keep_structural_and_freshness_failures_visible(
+        self, tmp_path
+    ):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {"1": {"fiveHourCeilingPct": 90}},
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
+                make_account(
+                    1,
+                    active=True,
+                    disabled=True,
+                    entry=make_entry(20, 10, age_s=400),
+                ),
+            ),
+            taken_at=time.time(),
+        )
+
+        plain = shared_profile_observability(
+            snap, tmp_path, now=time.time(), unhealthy_ticks=3
+        ).policies.plain
+
+        assert "ineligible · disabled; stale proof 6m" in plain
+
+    def test_priming_proof_shows_pin_baseline_confirmation_and_failures(
+        self, tmp_path
+    ):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "unhealthyTicks": 3,
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {"1": {"fiveHourCeilingPct": 90}},
+                    }
+                }
+            )
+        )
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "sharedProfileController": {
+                        "phase": "priming-pending",
+                        "activeSlot": "1",
+                        "baselineFiveHourResetAt": "2026-07-29T18:00:00Z",
+                        "activatedAt": time.time() - 60,
+                        "failedPolls": 2,
+                        "escalated": False,
+                        "primedSlots": [],
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(make_account(1, active=True),),
+            taken_at=time.time(),
+        )
+
+        proof = shared_profile_observability(
+            snap, tmp_path, now=time.time(), unhealthy_ticks=3
+        ).controller.plain
+
+        assert "STATE   priming-pending" in proof
+        assert "PIN     slot 1 · active profile remains pinned" in proof
+        assert "BASE    5h reset 2026-07-29T18:00:00Z" in proof
+        assert "PROOF   waiting for fresh post-activation 5h reset advance" in proof
+        assert "FAIL    2/3 proof polls · below escalation threshold" in proof
+
+    def test_steady_proof_shows_dwell_and_material_change(self, tmp_path):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        now = time.time()
+        current = make_entry(11.5, 20, age_s=5)
+        baseline = {
+            **current.last_good,
+            "five_hour": {
+                **current.last_good["five_hour"],
+                "pct": 10.0,
+            },
+        }
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {
+                            "enabled": True,
+                            "dwellSeconds": 900,
+                            "materialUsageDeltaPct": 1,
+                        },
+                        "slotPolicies": {"1": {"fiveHourCeilingPct": 90}},
+                    }
+                }
+            )
+        )
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "sharedProfileController": {
+                        "phase": "steady",
+                        "activeSlot": "1",
+                        "dwellUntil": now + 300,
+                        "activationUsage": baseline,
+                        "primedSlots": ["1"],
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(make_account(1, active=True, entry=current),),
+            taken_at=now,
+        )
+
+        proof = shared_profile_observability(
+            snap, tmp_path, now=now, unhealthy_ticks=3
+        ).controller.plain
+
+        assert "PROOF   confirmed primed slots: 1" in proof
+        assert "DWELL   5m remaining · voluntary move blocked" in proof
+        assert "CHANGE  confirmed · 1.5pp >= 1pp same-reset" in proof
+
+    def test_steady_material_change_requires_fresh_successful_usage(self, tmp_path):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        now = time.time()
+        current = make_entry(12, 20, age_s=400)
+        baseline = {
+            **current.last_good,
+            "five_hour": {**current.last_good["five_hour"], "pct": 10},
+        }
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {"1": {"fiveHourCeilingPct": 90}},
+                    }
+                }
+            )
+        )
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "sharedProfileController": {
+                        "phase": "steady",
+                        "activeSlot": "1",
+                        "dwellUntil": now - 1,
+                        "activationUsage": baseline,
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(make_account(1, active=True, entry=current),),
+            taken_at=now,
+        )
+
+        proof = shared_profile_observability(
+            snap, tmp_path, now=now, unhealthy_ticks=3
+        ).controller.plain
+
+        assert "CHANGE  proof unavailable · active usage is not fresh" in proof
+
+    def test_steady_missing_dwell_proof_fails_closed(self, tmp_path):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {"1": {"fiveHourCeilingPct": 90}},
+                    }
+                }
+            )
+        )
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "sharedProfileController": {
+                        "phase": "steady",
+                        "activeSlot": "1",
+                        "activationUsage": make_entry().last_good,
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(make_account(1, active=True),),
+            taken_at=time.time(),
+        )
+
+        proof = shared_profile_observability(
+            snap, tmp_path, now=time.time(), unhealthy_ticks=3
+        ).controller.plain
+
+        assert "DWELL   proof unavailable · voluntary move blocked" in proof
+
+    def test_steady_proof_shows_paced_ranking_from_fresh_eligible_slots(
+        self, tmp_path
+    ):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        now = time.time()
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {
+                            "1": {"fiveHourCeilingPct": 90},
+                            "2": {"fiveHourCeilingPct": 90},
+                        },
+                    }
+                }
+            )
+        )
+        active = make_entry(30, 60, age_s=5)
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "sharedProfileController": {
+                        "phase": "steady",
+                        "activeSlot": "2",
+                        "dwellUntil": now - 1,
+                        "activationUsage": active.last_good,
+                        "primedSlots": ["1", "2"],
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="2",
+            accounts=(
+                make_account(1, entry=make_entry(20, 10, age_s=5)),
+                make_account(2, active=True, entry=active),
+            ),
+            taken_at=now,
+        )
+
+        proof = shared_profile_observability(
+            snap, tmp_path, now=now, unhealthy_ticks=3
+        ).controller.plain
+
+        assert "RANK    1 > 2 · slot 1 leads configured-maximum pace" in proof
+
+    def test_steady_proof_labels_reset_unknown_availability_fallback(
+        self, tmp_path
+    ):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        now = time.time()
+        entries = []
+        for pct, slot in ((10, 1), (20, 2)):
+            entry = make_entry(30, pct, age_s=5)
+            entry.last_good["seven_day"].pop("resets_at")
+            entries.append(make_account(slot, active=slot == 1, entry=entry))
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {
+                            "1": {"fiveHourCeilingPct": 90, "priority": 20},
+                            "2": {"fiveHourCeilingPct": 90, "priority": 10},
+                        },
+                    }
+                }
+            )
+        )
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "sharedProfileController": {
+                        "phase": "steady",
+                        "activeSlot": "1",
+                        "dwellUntil": now + 60,
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="1", accounts=tuple(entries), taken_at=now
+        )
+
+        proof = shared_profile_observability(
+            snap, tmp_path, now=now, unhealthy_ticks=3
+        ).controller.plain
+
+        assert (
+            "FALLBACK 1 > 2 · weekly reset unavailable; "
+            "5h urgency then priority/slot"
+        ) in proof
+
+    def test_verification_blocked_shows_parking_boundary_and_wake_reason(
+        self, tmp_path
+    ):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        now = time.time()
+        wake_at = now + 600
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {"1": {"fiveHourCeilingPct": 50}},
+                    }
+                }
+            )
+        )
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "sharedProfileController": {
+                        "phase": "verification-blocked",
+                        "reason": "worker-admission-hold-unavailable",
+                        "allCapped": True,
+                        "activeSlot": "3",
+                        "proposedParkSlot": "1",
+                        "wakeAt": wake_at,
+                        "primedSlots": ["1", "2", "3"],
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="3",
+            accounts=(make_account(3, active=True, entry=make_entry(50, 100)),),
+            taken_at=now,
+        )
+
+        proof = shared_profile_observability(
+            snap, tmp_path, now=now, unhealthy_ticks=3
+        ).controller.plain
+
+        assert "REASON  worker admission hold unavailable" in proof
+        assert "CAPS    all slots freshly proved capped" in proof
+        assert "PARK    proposed slot 1 · blocked; retaining active slot 3" in proof
+        assert "WAKE    in 10m · earliest complete capped-window recovery" in proof
+
+    def test_verification_blocked_distinguishes_overdue_wake_from_unknown(
+        self, tmp_path
+    ):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        now = time.time()
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {"1": {"fiveHourCeilingPct": 50}},
+                    }
+                }
+            )
+        )
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "sharedProfileController": {
+                        "phase": "verification-blocked",
+                        "reason": "worker-admission-hold-unavailable",
+                        "activeSlot": "1",
+                        "proposedParkSlot": "1",
+                        "wakeAt": now - 60,
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(make_account(1, active=True),),
+            taken_at=now,
+        )
+
+        proof = shared_profile_observability(
+            snap, tmp_path, now=now, unhealthy_ticks=3
+        ).controller.plain
+
+        assert "WAKE    overdue by 1m · recovery poll due now" in proof
+
+    def test_selecting_proof_explains_target_and_locked_recheck(self, tmp_path):
+        from claude_swap.tui.autoview import shared_profile_observability
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {"enabled": True},
+                        "slotPolicies": {
+                            "1": {"fiveHourCeilingPct": 90},
+                            "2": {"fiveHourCeilingPct": 90},
+                        },
+                    }
+                }
+            )
+        )
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps(
+                {
+                    "sharedProfileController": {
+                        "phase": "selecting",
+                        "reason": "paced",
+                        "activeSlot": "1",
+                        "targetSlot": "2",
+                        "snapshotRevision": "abcdef123456",
+                    }
+                }
+            )
+        )
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(make_account(1, active=True), make_account(2)),
+            taken_at=time.time(),
+        )
+
+        proof = shared_profile_observability(
+            snap, tmp_path, now=time.time(), unhealthy_ticks=3
+        ).controller.plain
+
+        assert "SELECT  slot 2 · paced" in proof
+        assert "SNAP    abcdef123456" in proof
+        assert "CHECK   fresh active + target; policy, identity, ranking" in proof
+
+
 
 class _FakeEngine:
     """Stands in for AutoSwitchEngine: records construction, blocks until stop."""
@@ -1342,6 +1871,53 @@ class TestAutoScreen:
             from textual.widgets import RichLog
 
             assert len(app.screen.query_one("#event-log", RichLog).lines) > 0
+
+    async def test_shared_profile_stacks_proof_above_full_width_policies(
+        self, tmp_path, fake_engine
+    ):
+        settings = json.dumps(
+            {
+                "autoswitch": {
+                    "sharedProfile": {"enabled": True},
+                    "slotPolicies": {
+                        "1": {
+                            "fiveHourCeilingPct": 90,
+                            "weeklyCeilingPct": 100,
+                            "priority": 30,
+                        }
+                    },
+                }
+            }
+        )
+        (tmp_path / "settings.json").write_text(settings)
+        fake = FakeSwitcher(
+            [make_account(1, active=True, entry=make_entry(42, 31))],
+            tmp_path,
+        )
+        app = make_app(fake)
+
+        async with app.run_test(size=(120, 44)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            policies = app.screen.query_one("#slot-policies", Static)
+            controller = app.screen.query_one("#controller-proof", Static)
+            candidates = app.screen.query_one("#candidates", Static)
+            assert policies.display is True
+            assert controller.display is True
+            assert candidates.display is False
+            assert controller.region.y < policies.region.y
+            assert policies.size.width == controller.size.width
+            assert "SLOT POLICIES" in policies.render().plain
+            assert "CONTROLLER PROOF" in controller.render().plain
+            assert "shared-profile rotation · read-only policy + proof" in (
+                app.screen.query_one("#auto-summary", Static).render().plain
+            )
+            await pilot.press("t", "right")
+            await pilot.pause()
+            assert app.screen._settings.threshold == 91
+            assert (tmp_path / "settings.json").read_text() == settings
 
     async def test_go_live_requires_confirmation(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
@@ -1702,4 +2278,3 @@ class TestThemeWiring:
             await menu_select(pilot, "theme:light")
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
-

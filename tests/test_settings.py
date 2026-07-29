@@ -14,8 +14,10 @@ from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
     AutoSwitchSettings,
+    SharedProfileSettings,
     UiSettings,
     effective_settings,
+    load_shared_profile_settings,
     load_settings,
     load_ui_settings,
     merged_with_cli,
@@ -162,11 +164,67 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["autoswitch.sharedProfile"] == {
+            f.name for f in SharedProfileSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "autoswitch.sharedProfile": SharedProfileSettings(),
+            "ui": UiSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
+
+
+class TestSharedProfileRolloutSettings:
+    def test_rollout_stage_defaults_to_contract(self, tmp_path: Path):
+        assert load_shared_profile_settings(tmp_path).rollout_stage == "contract"
+
+    def test_rollout_stage_round_trips_through_strict_setting(self, tmp_path: Path):
+        assert (
+            set_setting(
+                tmp_path,
+                "autoswitch.sharedProfile.rolloutStage",
+                "small-roster",
+            )
+            == "small-roster"
+        )
+        assert (
+            load_shared_profile_settings(tmp_path).rollout_stage
+            == "small-roster"
+        )
+
+    def test_unknown_rollout_stage_is_rejected_fail_closed(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps(
+                {
+                    "autoswitch": {
+                        "sharedProfile": {
+                            "enabled": True,
+                            "rolloutStage": "full-send",
+                        }
+                    }
+                }
+            )
+        )
+        with pytest.raises(ConfigError, match="rolloutStage"):
+            load_shared_profile_settings(tmp_path)
+
+    def test_manual_hold_is_an_explicit_strict_rollback_gate(
+        self, tmp_path: Path
+    ):
+        assert load_shared_profile_settings(tmp_path).manual_hold is False
+        assert (
+            set_setting(
+                tmp_path,
+                "autoswitch.sharedProfile.manualHold",
+                "true",
+            )
+            is True
+        )
+        assert load_shared_profile_settings(tmp_path).manual_hold is True
 
 
 class TestSetUnsetSetting:
@@ -279,3 +337,45 @@ class TestMergedWithCli:
     def test_strategy_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
+
+
+class TestPerWindowThresholdSettings:
+    def test_defaults_none_fall_back_to_threshold(self):
+        s = AutoSwitchSettings(threshold=88.0)
+        assert s.five_hour_threshold is None
+        assert s.seven_day_threshold is None
+        assert s.eff_5h() == 88.0
+        assert s.eff_7d() == 88.0
+        assert s.min_effective_threshold() == 88.0
+
+    def test_overrides_win_over_threshold(self):
+        s = AutoSwitchSettings(
+            threshold=90.0, five_hour_threshold=95.0, seven_day_threshold=70.0
+        )
+        assert s.eff_5h() == 95.0
+        assert s.eff_7d() == 70.0
+        assert s.min_effective_threshold() == 70.0
+
+    def test_cli_overrides_merge(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(),
+            _args(five_hour_threshold=97.0, seven_day_threshold=75.0),
+        )
+        assert merged.five_hour_threshold == 97.0
+        assert merged.seven_day_threshold == 75.0
+
+    def test_config_set_and_load_roundtrip(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.fiveHourThreshold", "96")
+        set_setting(tmp_path, "autoswitch.sevenDayThreshold", "72")
+        loaded = load_settings(tmp_path)
+        assert loaded.five_hour_threshold == 96.0
+        assert loaded.seven_day_threshold == 72.0
+
+    def test_config_set_rejects_out_of_range(self, tmp_path: Path):
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, "autoswitch.sevenDayThreshold", "10")
+
+    def test_unset_restores_fallback(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.sevenDayThreshold", "72")
+        assert unset_setting(tmp_path, "autoswitch.sevenDayThreshold") is True
+        assert load_settings(tmp_path).seven_day_threshold is None

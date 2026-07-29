@@ -8,7 +8,7 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -572,6 +572,26 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--5h-threshold",
+        dest="five_hour_threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Per-window 5h trigger pct (50-99.9); overrides --threshold for "
+            "the 5-hour window only. Unset: falls back to --threshold"
+        ),
+    )
+    parser.add_argument(
+        "--7d-threshold",
+        dest="seven_day_threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Per-window 7d trigger pct (50-99.9); overrides --threshold for "
+            "the 7-day window only. Unset: falls back to --threshold"
+        ),
+    )
+    parser.add_argument(
         "--cooldown",
         type=float,
         metavar="SECONDS",
@@ -612,6 +632,14 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Evaluate and report, but never switch or write state",
     )
     parser.add_argument(
+        "--reconcile-shared",
+        action="store_true",
+        help=(
+            "Explicitly retry a verification-blocked shared controller from "
+            "fresh observations (admission proof is still required)"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -644,11 +672,14 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        engine_kwargs = {"dry_run": args.dry_run}
+        if args.reconcile_shared:
+            engine_kwargs["manual_reconcile"] = True
         engine = AutoSwitchEngine(
             switcher,
             settings,
             jsonl_emit if args.json else human_emit,
-            dry_run=args.dry_run,
+            **engine_kwargs,
         )
 
         if args.once:
@@ -824,6 +855,220 @@ Examples:
         sys.exit(130)
 
 
+def _slot_policy_command(argv: list[str]) -> None:
+    """Handle the sole writer for current-slot safety policy."""
+    from claude_swap.settings import (
+        DEFAULT_SLOT_POLICY,
+        load_shared_profile_settings,
+        load_slot_policies,
+        set_slot_policy,
+        unset_slot_policy,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} slot-policy",
+        description=(
+            "Inspect or edit current-slot safety policies. Policies stay with "
+            "slot numbers when roster occupants move or swap."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap slot-policy list
+  cswap slot-policy set 3 --5h-ceiling 50 --weekly-ceiling 100 --priority 10
+  cswap slot-policy unset 3
+  cswap slot-policy audit
+  cswap slot-policy audit --strict
+
+Setting policy does not enable shared-profile autoswitch. During a monthly
+roster change: pause the controller, edit policy intent, change the roster,
+run `audit --strict`, refresh usage, then resume.
+        """,
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON (with list or audit)",
+    )
+    sub = parser.add_subparsers(
+        dest="action", metavar="{list,set,unset,audit}", required=True
+    )
+    p_list = sub.add_parser("list", help="List effective policies by current slot")
+    p_audit = sub.add_parser(
+        "audit", help="Compare explicit policy intent with the current roster"
+    )
+    p_audit.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail unless occupied slots and explicit policy slots match exactly",
+    )
+    for subparser in (p_list, p_audit):
+        subparser.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Emit machine-readable JSON",
+        )
+    p_set = sub.add_parser("set", help="Validate and replace one slot policy")
+    p_set.add_argument("slot", metavar="SLOT")
+    p_set.add_argument(
+        "--5h-ceiling",
+        dest="five_hour_ceiling",
+        required=True,
+        type=float,
+        metavar="PCT",
+        help="5-hour utilization ceiling (1-100)",
+    )
+    p_set.add_argument(
+        "--weekly-ceiling",
+        type=float,
+        default=DEFAULT_SLOT_POLICY.weekly_ceiling_pct,
+        metavar="PCT",
+        help="Weekly utilization ceiling (1-100; default 100)",
+    )
+    p_set.add_argument(
+        "--priority",
+        type=int,
+        default=DEFAULT_SLOT_POLICY.priority,
+        metavar="N",
+        help="Final tie-break and priming priority (-1000 to 1000; default 0)",
+    )
+    p_unset = sub.add_parser("unset", help="Remove one explicit slot policy")
+    p_unset.add_argument("slot", metavar="SLOT")
+
+    args = parser.parse_args(argv)
+    json_mode = bool(getattr(args, "json", False))
+    if json_mode and args.action not in ("list", "audit"):
+        parser.error("--json can only be used with list or audit")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        root = switcher.backup_dir
+
+        if args.action == "set":
+            policy = set_slot_policy(
+                root,
+                args.slot,
+                five_hour_ceiling_pct=args.five_hour_ceiling,
+                weekly_ceiling_pct=args.weekly_ceiling,
+                priority=args.priority,
+            )
+            print(
+                f"{accent('Set slot policy')} slot {args.slot}: "
+                f"5h {policy.five_hour_ceiling_pct:g}%, "
+                f"weekly {policy.weekly_ceiling_pct:g}%, "
+                f"priority {policy.priority}"
+            )
+            return
+
+        if args.action == "unset":
+            if unset_slot_policy(root, args.slot):
+                print(f"{accent('Unset slot policy')} slot {args.slot}")
+            else:
+                print(
+                    muted(f"Slot {args.slot} has no explicit policy; nothing to do"),
+                    file=sys.stderr,
+                )
+            return
+
+        explicit = load_slot_policies(root)
+        shared_enabled = load_shared_profile_settings(root).enabled
+        occupied = switcher.slot_roster()
+
+        rows = []
+        for slot in sorted(set(occupied) | set(explicit)):
+            policy = explicit.get(slot, DEFAULT_SLOT_POLICY)
+            occupant = occupied.get(slot)
+            source = (
+                "explicit"
+                if occupant is not None and slot in explicit
+                else "defaulted"
+                if occupant is not None
+                else "vacant"
+            )
+            rows.append(
+                {
+                    "slot": slot,
+                    "occupant": occupant,
+                    "fiveHourCeilingPct": policy.five_hour_ceiling_pct,
+                    "weeklyCeilingPct": policy.weekly_ceiling_pct,
+                    "priority": policy.priority,
+                    "source": source,
+                }
+            )
+
+        problems = [
+            f"slot {slot} is occupied but has no explicit policy"
+            for slot in sorted(set(occupied) - set(explicit))
+        ]
+        problems.extend(
+            f"slot {slot} has an explicit policy but is vacant"
+            for slot in sorted(set(explicit) - set(occupied))
+        )
+        strict = args.action == "audit" and bool(getattr(args, "strict", False))
+        if json_mode and strict and problems:
+            raise ConfigError(
+                "strict slot-policy audit failed:\n  - " + "\n  - ".join(problems)
+            )
+
+        if json_mode:
+            print(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "sharedProfileEnabled": shared_enabled,
+                        "slots": rows,
+                        "strict": strict,
+                        "auditProblems": problems if args.action == "audit" else [],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            if rows:
+                print("SLOT  OCCUPANT                     5H       WEEKLY   PRI    SOURCE")
+                for row in rows:
+                    occupant = row["occupant"] or "vacant"
+                    print(
+                        f"{row['slot']:<5} {occupant:<28} "
+                        f"{row['fiveHourCeilingPct']:>5g}%   "
+                        f"{row['weeklyCeilingPct']:>5g}%   "
+                        f"{row['priority']:>4}   {row['source']}"
+                    )
+            else:
+                print(dimmed("No occupied slots or explicit slot policies."))
+
+        if args.action == "audit":
+            if strict and problems:
+                raise ConfigError(
+                    "strict slot-policy audit failed:\n  - " + "\n  - ".join(problems)
+                )
+            if not json_mode:
+                if strict:
+                    print(f"\n{accent('Strict audit passed')}: roster matches policy intent.")
+                elif problems:
+                    print(
+                        "\nAudit findings:\n  - " + "\n  - ".join(problems),
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"\n{accent('Audit passed')}: roster matches policy intent.")
+    except ClaudeSwitchError as exc:
+        if json_mode:
+            print(json.dumps(error_envelope(exc), indent=2))
+        else:
+            error(f"Error: {exc}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if json_mode else sys.stdout,
+        )
+        sys.exit(130)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -874,6 +1119,9 @@ def main() -> None:
         return  # only reachable in tests where sys.exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
+        return
+    if argv and argv[0] == "slot-policy":
+        _slot_policy_command(argv[1:])
         return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
@@ -930,6 +1178,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
+  %(prog)s slot-policy <action>       audit or change current-slot policies
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
@@ -951,6 +1200,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
+  %(prog)s slot-policy set 3 --5h-ceiling 50
 
 The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.
         """,

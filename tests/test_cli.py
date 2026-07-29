@@ -867,11 +867,12 @@ class TestAutoCommand:
         tick_outcome = None  # set per test (TickOutcome)
 
         def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                     state_path=None, clock=None):
+                     state_path=None, clock=None, manual_reconcile=False):
             self.switcher = switcher
             self.settings = settings
             self.on_event = on_event
             self.dry_run = dry_run
+            self.manual_reconcile = manual_reconcile
             type(self).instances.append(self)
 
         def tick(self):
@@ -937,6 +938,10 @@ class TestAutoCommand:
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
+
+    def test_shared_reconciliation_is_explicitly_forwarded(self, temp_home):
+        self._run(["--once", "--reconcile-shared"], temp_home)
+        assert self.FakeEngine.instances[-1].manual_reconcile is True
 
     def test_json_stdout_is_pure_jsonl(self, temp_home, capsys):
         from claude_swap.autoswitch import NoSwitchEvent, TickOutcome

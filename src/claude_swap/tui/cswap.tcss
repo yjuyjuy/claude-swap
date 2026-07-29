@@ -114,6 +114,21 @@ MenuItem Static.menu-item-muted { color: $secondary; }
     height: auto;
 }
 
+#shared-observability {
+    display: none;
+    height: auto;
+}
+
+#slot-policies, #controller-proof {
+    width: 1fr;
+    height: auto;
+    padding: 0 1;
+}
+
+#controller-proof {
+    border-bottom: solid $panel;
+}
+
 #event-log {
     background: $background;
     border-top: solid $panel;
