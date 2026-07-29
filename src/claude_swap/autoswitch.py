@@ -354,6 +354,85 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+@dataclass(frozen=True)
+class SharedProfileSafetyEvent(AutoSwitchEvent):
+    """Additive proof that a rollout or recovery gate held actuation closed."""
+
+    kind: ClassVar[str] = "shared-profile-safety"
+    reason: str
+    rollout_stage: str
+    worker_admission_ready: bool
+    controller_phase: str | None = None
+    manual_reconciliation_required: bool = True
+
+    def _fields(self) -> dict:
+        return {
+            "reason": self.reason,
+            "rolloutStage": self.rollout_stage,
+            "workerAdmissionReady": self.worker_admission_ready,
+            "controllerPhase": self.controller_phase,
+            "manualReconciliationRequired": self.manual_reconciliation_required,
+        }
+
+    def human(self) -> str:
+        return (
+            "shared-profile actuation held: "
+            f"{self.reason} (stage {self.rollout_stage})"
+        )
+
+
+@dataclass(frozen=True)
+class SharedProfileActivationEvent(AutoSwitchEvent):
+    """Locked ceiling proof paired with one committed shared-profile switch."""
+
+    kind: ClassVar[str] = "shared-profile-activation-verified"
+    trigger: str
+    selection_epoch: str
+    policy_revision: str
+    controller_state: str
+    active_slot: str
+    target_slot: str
+    target_identity: dict
+    prelock_observation_revision: str
+    locked_observation_revision: str
+    prelock_fetched_at: float
+    locked_fetched_at: float
+    five_hour_pct: float
+    weekly_pct: float
+    five_hour_ceiling_pct: float
+    weekly_ceiling_pct: float
+
+    def _fields(self) -> dict:
+        return {
+            "trigger": self.trigger,
+            "selectionEpoch": self.selection_epoch,
+            "controllerRevision": self.selection_epoch,
+            "controllerState": self.controller_state,
+            "policyRevision": self.policy_revision,
+            "activeSlot": self.active_slot,
+            "targetSlot": self.target_slot,
+            "targetIdentity": self.target_identity,
+            "prelockObservationRevision": self.prelock_observation_revision,
+            "lockedObservationRevision": self.locked_observation_revision,
+            "prelockFetchedAt": self.prelock_fetched_at,
+            "lockedFetchedAt": self.locked_fetched_at,
+            "fiveHourPct": self.five_hour_pct,
+            "weeklyPct": self.weekly_pct,
+            "fiveHourCeilingPct": self.five_hour_ceiling_pct,
+            "weeklyCeilingPct": self.weekly_ceiling_pct,
+            "strictlyEligible": (
+                self.five_hour_pct < self.five_hour_ceiling_pct
+                and self.weekly_pct < self.weekly_ceiling_pct
+            ),
+        }
+
+    def human(self) -> str:
+        return (
+            f"verified rotating seat {self.target_slot} for {self.trigger} "
+            f"(epoch {self.selection_epoch[:12]})"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -500,6 +579,8 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        worker_admission_ready: Callable[[], bool] | None = None,
+        manual_reconcile: bool = False,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -517,6 +598,12 @@ class AutoSwitchEngine:
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
+        # Ticket #12 deliberately ships no Firstmate integration. Production
+        # therefore has no way to prove durable worker admission and remains
+        # held. Tests may inject a proof boundary to exercise controller
+        # behavior without inventing queue ownership here.
+        self._worker_admission_ready = worker_admission_ready or (lambda: False)
+        self._manual_reconcile = manual_reconcile
         self._stop = threading.Event()
         # Cuts the current inter-tick sleep short (a session threshold change
         # from the TUI should show a fresh decision now, not next interval).
@@ -544,11 +631,49 @@ class AutoSwitchEngine:
         return FileLock(self.state_path.parent / ".autoswitch_state.lock")
 
     def _read_state(self) -> dict:
+        return self._read_state_checked()[0]
+
+    def _read_state_checked(self) -> tuple[dict, bool]:
+        """Read once, preserving whether an existing artifact was valid."""
         try:
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}, True
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return {}
-        return raw if isinstance(raw, dict) else {}
+            return {}, False
+        return (raw, True) if isinstance(raw, dict) else ({}, False)
+
+    def _hold_shared_profile(
+        self,
+        *,
+        reason: str,
+        shared: SharedProfileSettings,
+        controller: object,
+        worker_ready: bool,
+        persist: bool,
+        manual_reconciliation_required: bool = True,
+    ) -> TickOutcome:
+        phase = controller.get("phase") if isinstance(controller, dict) else None
+        if persist and not self.dry_run:
+            blocked = {
+                **(controller if isinstance(controller, dict) else {}),
+                "phase": "verification-blocked",
+                "reason": reason,
+                "rolloutStage": shared.rollout_stage,
+                "manualReconciliationRequired": manual_reconciliation_required,
+            }
+            self._store_controller(blocked)
+        self._emit(
+            SharedProfileSafetyEvent(
+                reason=reason,
+                rollout_stage=shared.rollout_stage,
+                worker_admission_ready=worker_ready,
+                controller_phase=phase,
+                manual_reconciliation_required=manual_reconciliation_required,
+            )
+        )
+        self._emit(NoSwitchEvent(reason=reason))
+        return TickOutcome.BLOCKED
 
     def _mutate_state(self, mutator: Callable[[dict], None]) -> dict:
         """Read-modify-write the state file under its lock; returns new state.
@@ -735,7 +860,7 @@ class AutoSwitchEngine:
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
-        state = self._read_state()
+        state, state_readable = self._read_state_checked()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
             # only released (state mutation) on real ticks.
@@ -776,7 +901,79 @@ class AutoSwitchEngine:
         }
 
         shared = load_shared_profile_settings(self.switcher.backup_dir)
+        controller = state.get("sharedProfileController")
+        if shared.manual_hold:
+            return self._hold_shared_profile(
+                reason="operator-manual-hold",
+                shared=shared,
+                controller=controller,
+                worker_ready=False,
+                persist=True,
+            )
         if shared.enabled:
+            if not state_readable:
+                return self._hold_shared_profile(
+                    reason="controller-state-unreadable",
+                    shared=shared,
+                    controller=None,
+                    worker_ready=False,
+                    persist=False,
+                )
+            phase = (
+                controller.get("phase")
+                if isinstance(controller, dict)
+                else None
+            )
+            if phase == "verification-blocked" and not self._manual_reconcile:
+                return self._hold_shared_profile(
+                    reason="verification-blocked",
+                    shared=shared,
+                    controller=controller,
+                    worker_ready=False,
+                    persist=True,
+                )
+            if phase == "selecting" and not self._manual_reconcile:
+                return self._hold_shared_profile(
+                    reason="interrupted-selection-manual-reconciliation",
+                    shared=shared,
+                    controller=controller,
+                    worker_ready=False,
+                    persist=True,
+                )
+            if shared.rollout_stage == "contract":
+                return self._hold_shared_profile(
+                    reason="rollout-contract",
+                    shared=shared,
+                    controller=controller,
+                    worker_ready=False,
+                    persist=False,
+                    manual_reconciliation_required=False,
+                )
+            if shared.rollout_stage == "shadow" and not self.dry_run:
+                return self._hold_shared_profile(
+                    reason="shadow-requires-dry-run",
+                    shared=shared,
+                    controller=controller,
+                    worker_ready=False,
+                    persist=False,
+                    manual_reconciliation_required=False,
+                )
+            try:
+                worker_ready = (
+                    False
+                    if shared.rollout_stage == "shadow"
+                    else bool(self._worker_admission_ready())
+                )
+            except Exception:
+                worker_ready = False
+            if shared.rollout_stage != "shadow" and not worker_ready:
+                return self._hold_shared_profile(
+                    reason="worker-admission-hold-unavailable",
+                    shared=shared,
+                    controller=controller,
+                    worker_ready=False,
+                    persist=True,
+                )
             return self._tick_shared_profile(
                 current=current,
                 current_email=current_email,
@@ -1194,6 +1391,44 @@ class AutoSwitchEngine:
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
 
+    def _emit_shared_activation_proof(
+        self,
+        *,
+        trigger: str,
+        selection_epoch: str,
+        policy_revision: str,
+        controller_state: str,
+        target: str,
+        prelock_usage: dict,
+        locked_usage: dict,
+        prelock_fetched_at: float,
+        locked_fetched_at: float,
+        policy: SlotPolicy,
+    ) -> None:
+        self._emit(
+            SharedProfileActivationEvent(
+                trigger=trigger,
+                selection_epoch=selection_epoch,
+                policy_revision=policy_revision,
+                controller_state=controller_state,
+                active_slot=target,
+                target_slot=target,
+                target_identity=self.switcher.account_identity(target),
+                prelock_observation_revision=(
+                    f"{selection_epoch}:candidate:{prelock_fetched_at:.9f}"
+                ),
+                locked_observation_revision=(
+                    f"{selection_epoch}:locked-recheck:{locked_fetched_at:.9f}"
+                ),
+                prelock_fetched_at=prelock_fetched_at,
+                locked_fetched_at=locked_fetched_at,
+                five_hour_pct=float(locked_usage["five_hour"]["pct"]),
+                weekly_pct=float(locked_usage["seven_day"]["pct"]),
+                five_hour_ceiling_pct=policy.five_hour_ceiling_pct,
+                weekly_ceiling_pct=policy.weekly_ceiling_pct,
+            )
+        )
+
     def _shared_policies(
         self, quarantined: set[str]
     ) -> dict[str, SlotPolicy]:
@@ -1213,6 +1448,7 @@ class AutoSwitchEngine:
         shared: SharedProfileSettings,
         *,
         primed_slots: list[str] | None = None,
+        controller_revision: str | None = None,
     ) -> dict:
         now = self.clock()
         primed = sorted(
@@ -1224,6 +1460,7 @@ class AutoSwitchEngine:
             "activeSlot": slot,
             "identity": self.switcher.account_identity(slot),
             "policyRevision": self._policy_revision(policies, shared),
+            "controllerRevision": controller_revision,
             "activatedAt": now,
             "dwellUntil": now + shared.dwell_seconds,
             "activationUsage": usage,
@@ -1292,6 +1529,25 @@ class AutoSwitchEngine:
         value = window.get("resets_at")
         return value if isinstance(value, str) else None
 
+    @staticmethod
+    def _five_hour_reset_is_valid_or_missing(usage: object) -> bool:
+        if not isinstance(usage, dict):
+            return False
+        window = usage.get("five_hour")
+        if not isinstance(window, dict):
+            return False
+        if "resets_at" not in window:
+            return True
+        return _parse_reset_ts(window.get("resets_at")) is not None
+
+    @classmethod
+    def _verified_priming_baseline(
+        cls, usage: object, policy: SlotPolicy
+    ) -> bool:
+        return verified_eligible(
+            usage, policy
+        ) and cls._five_hour_reset_is_valid_or_missing(usage)
+
     def _priming_controller(
         self,
         *,
@@ -1301,6 +1557,7 @@ class AutoSwitchEngine:
         shared: SharedProfileSettings,
         primed_slots: list[str],
         baseline_failures: int,
+        controller_revision: str,
     ) -> dict:
         now = self.clock()
         return {
@@ -1308,6 +1565,7 @@ class AutoSwitchEngine:
             "activeSlot": slot,
             "identity": self.switcher.account_identity(slot),
             "policyRevision": self._policy_revision(policies, shared),
+            "controllerRevision": controller_revision,
             "baselineFiveHourResetAt": self._five_hour_reset(baseline),
             "activatedAt": now,
             "failedPolls": 0,
@@ -1474,11 +1732,12 @@ class AutoSwitchEngine:
         shared: SharedProfileSettings,
         primed_slots: list[str],
         baseline_failures: int,
+        baseline_fetched_at: float,
         expected_identities: dict[str, dict],
         current_email: str,
     ) -> TickOutcome:
         baseline = snapshot_usage.get(target)
-        if not verified_eligible(baseline, policies[target]):
+        if not self._verified_priming_baseline(baseline, policies[target]):
             self._emit(
                 NoSwitchEvent(
                     reason="priming-baseline-unavailable",
@@ -1490,6 +1749,20 @@ class AutoSwitchEngine:
             )
             return TickOutcome.BLOCKED
         assert isinstance(baseline, dict)
+        prelock_baseline = baseline
+        policy_revision = self._policy_revision(policies, shared)
+        selection_epoch = hashlib.sha256(
+            json.dumps(
+                {
+                    "trigger": "priming",
+                    "targetSlot": target,
+                    "policyRevision": policy_revision,
+                    "baseline": prelock_baseline,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         if self.dry_run:
             self._emit(
                 NoSwitchEvent(
@@ -1535,7 +1808,10 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="target-freshen-failed"))
                 return TickOutcome.NO_ACTION
             locked_baseline = self.switcher.fetch_usage_now(target)
-            if not verified_eligible(locked_baseline, locked_policies[target]):
+            locked_fetched_at = self.clock()
+            if not self._verified_priming_baseline(
+                locked_baseline, locked_policies[target]
+            ):
                 self._emit(NoSwitchEvent(reason="target-recheck-ineligible"))
                 return TickOutcome.NO_ACTION
             assert isinstance(locked_baseline, dict)
@@ -1553,10 +1829,23 @@ class AutoSwitchEngine:
                 shared=locked_shared,
                 primed_slots=primed_slots,
                 baseline_failures=baseline_failures,
+                controller_revision=selection_epoch,
             )
             atomic_write_json(self.state_path, state)
 
         if result:
+            self._emit_shared_activation_proof(
+                trigger="priming",
+                selection_epoch=selection_epoch,
+                policy_revision=policy_revision,
+                controller_state="priming-pending",
+                target=target,
+                prelock_usage=prelock_baseline,
+                locked_usage=baseline,
+                prelock_fetched_at=baseline_fetched_at,
+                locked_fetched_at=locked_fetched_at,
+                policy=locked_policies[target],
+            )
             self._emit(
                 SwitchEvent(
                     trigger="priming",
@@ -1634,6 +1923,28 @@ class AutoSwitchEngine:
     ) -> TickOutcome:
         controller = state.get("sharedProfileController")
         policies = self._shared_policies(quarantined)
+        if shared.rollout_stage == "canary" and len(policies) != 1:
+            return self._hold_shared_profile(
+                reason="canary-roster-scope",
+                shared=shared,
+                controller=controller,
+                worker_ready=True,
+                persist=True,
+            )
+        if (
+            shared.rollout_stage == "small-roster"
+            and any(
+                policy.five_hour_ceiling_pct == 50.0
+                for policy in policies.values()
+            )
+        ):
+            return self._hold_shared_profile(
+                reason="protected-seat-stage-required",
+                shared=shared,
+                controller=controller,
+                worker_ready=True,
+                persist=True,
+            )
         if (
             isinstance(controller, dict)
             and controller.get("phase") == "priming-pending"
@@ -1650,6 +1961,11 @@ class AutoSwitchEngine:
             and entry.fetched_at >= epoch_started
             and entry.last_error is None
             and isinstance(entry.last_good, dict)
+        }
+        fetched_at_by_slot = {
+            slot: float(entry.fetched_at)
+            for slot, entry in entries.items()
+            if slot in usage and entry.fetched_at is not None
         }
         ranked = rank_paced_slots(usage, policies, self.clock())
         active_usage = usage.get(current)
@@ -1683,6 +1999,7 @@ class AutoSwitchEngine:
                     if baseline_entry is not None
                     else 0
                 ),
+                baseline_fetched_at=fetched_at_by_slot[unprimed[0]],
                 expected_identities=identities,
                 current_email=current_email,
             )
@@ -1717,6 +2034,7 @@ class AutoSwitchEngine:
                         policies,
                         shared,
                         primed_slots=primed_slots,
+                        controller_revision=snapshot_revision,
                     )
                 )
                 self._emit(NoSwitchEvent(reason="controller-baseline"))
@@ -1785,6 +2103,7 @@ class AutoSwitchEngine:
             expected_identities=identities,
             snapshot_revision=snapshot_revision,
             snapshot_usage=usage,
+            snapshot_fetched_at=fetched_at_by_slot[target],
             policies=policies,
             shared=shared,
             failover=not active_eligible,
@@ -1802,6 +2121,7 @@ class AutoSwitchEngine:
         expected_identities: dict[str, dict],
         snapshot_revision: str,
         snapshot_usage: dict[str, dict],
+        snapshot_fetched_at: float,
         policies: dict[str, SlotPolicy],
         shared: SharedProfileSettings,
         failover: bool,
@@ -1869,6 +2189,7 @@ class AutoSwitchEngine:
                 return abort("target-freshen-failed")
             locked_active_usage = self.switcher.fetch_usage_now(current)
             locked_target_usage = self.switcher.fetch_usage_now(target)
+            locked_fetched_at = self.clock()
             if not verified_eligible(
                 locked_target_usage, locked_policies[target]
             ):
@@ -1916,12 +2237,26 @@ class AutoSwitchEngine:
                 locked_policies,
                 locked_shared,
                 primed_slots=primed_slots,
+                controller_revision=snapshot_revision,
             )
             atomic_write_json(self.state_path, state)
 
+        committed_trigger = "failover" if committed_failover else "paced"
+        self._emit_shared_activation_proof(
+            trigger=committed_trigger,
+            selection_epoch=snapshot_revision,
+            policy_revision=self._policy_revision(locked_policies, locked_shared),
+            controller_state="steady",
+            target=target,
+            prelock_usage=snapshot_usage[target],
+            locked_usage=locked_target_usage,
+            prelock_fetched_at=snapshot_fetched_at,
+            locked_fetched_at=locked_fetched_at,
+            policy=locked_policies[target],
+        )
         self._emit(
             SwitchEvent(
-                trigger="failover" if committed_failover else "paced",
+                trigger=committed_trigger,
                 from_ref=result.get("from")
                 or _ref(current, current_email),
                 to_ref=result.get("to"),

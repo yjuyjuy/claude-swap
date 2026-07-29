@@ -114,6 +114,8 @@ class SharedProfileSettings:
     """
 
     enabled: bool = False
+    rollout_stage: str = "contract"
+    manual_hold: bool = False
     dwell_seconds: int = 900
     material_usage_delta_pct: float = 1.0
 
@@ -215,6 +217,27 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch.sharedProfile", "enabled", "enabled", "bool",
             help="Enable fail-closed shared-profile rotation",
+        ),
+        SettingSpec(
+            "autoswitch.sharedProfile",
+            "rolloutStage",
+            "rollout_stage",
+            "choice",
+            choices=(
+                "contract",
+                "shadow",
+                "canary",
+                "small-roster",
+                "protected-seat",
+            ),
+            help="Staged shared-profile release gate",
+        ),
+        SettingSpec(
+            "autoswitch.sharedProfile",
+            "manualHold",
+            "manual_hold",
+            "bool",
+            help="Hold all autoswitch actuation during manual rollback",
         ),
         SettingSpec(
             "autoswitch.sharedProfile", "dwellSeconds", "dwell_seconds", "int",
@@ -665,6 +688,18 @@ def load_shared_profile_settings(backup_root: Path) -> SharedProfileSettings:
     enabled = shared.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ConfigError("autoswitch.sharedProfile.enabled must be true or false")
+    rollout_spec = SETTING_SPECS["autoswitch.sharedProfile.rolloutStage"]
+    rollout_stage = shared.get("rolloutStage", rollout_spec.default)
+    if rollout_stage not in rollout_spec.choices:
+        raise ConfigError(
+            "autoswitch.sharedProfile.rolloutStage must be one of: "
+            f"{', '.join(rollout_spec.choices)}"
+        )
+    manual_hold = shared.get("manualHold", False)
+    if not isinstance(manual_hold, bool):
+        raise ConfigError(
+            "autoswitch.sharedProfile.manualHold must be true or false"
+        )
     dwell_spec = SETTING_SPECS["autoswitch.sharedProfile.dwellSeconds"]
     dwell = shared.get("dwellSeconds", dwell_spec.default)
     if (
@@ -692,6 +727,8 @@ def load_shared_profile_settings(backup_root: Path) -> SharedProfileSettings:
         )
     return SharedProfileSettings(
         enabled=enabled,
+        rollout_stage=rollout_stage,
+        manual_hold=manual_hold,
         dwell_seconds=dwell,
         material_usage_delta_pct=float(delta),
     )

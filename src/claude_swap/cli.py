@@ -632,6 +632,14 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Evaluate and report, but never switch or write state",
     )
     parser.add_argument(
+        "--reconcile-shared",
+        action="store_true",
+        help=(
+            "Explicitly retry a verification-blocked shared controller from "
+            "fresh observations (admission proof is still required)"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -664,11 +672,14 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        engine_kwargs = {"dry_run": args.dry_run}
+        if args.reconcile_shared:
+            engine_kwargs["manual_reconcile"] = True
         engine = AutoSwitchEngine(
             switcher,
             settings,
             jsonl_emit if args.json else human_emit,
-            dry_run=args.dry_run,
+            **engine_kwargs,
         )
 
         if args.once:
