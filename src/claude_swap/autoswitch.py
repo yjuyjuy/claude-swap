@@ -30,6 +30,7 @@ read-modify-write under a dedicated file lock.
 from __future__ import annotations
 
 import enum
+import hashlib
 import json
 import logging
 import random
@@ -50,7 +51,21 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.paced_selector import (
+    material_usage_changed,
+    rank_paced_slots,
+    verified_eligible,
+)
+from claude_swap.settings import (
+    DEFAULT_SLOT_POLICY,
+    AutoSwitchSettings,
+    SharedProfileSettings,
+    SlotPolicy,
+    atomic_write_json,
+    load_shared_profile_settings,
+    load_slot_policies,
+    parse_model_names,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate
 
@@ -750,6 +765,16 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        shared = load_shared_profile_settings(self.switcher.backup_dir)
+        if shared.enabled:
+            return self._tick_shared_profile(
+                current=current,
+                current_email=current_email,
+                state=state,
+                shared=shared,
+                quarantined=quarantined,
+            )
+
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.min_effective_threshold()
         )
@@ -1134,6 +1159,304 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    # -- shared-profile rotation controller ---------------------------------
+
+    @staticmethod
+    def _policy_revision(
+        policies: dict[str, SlotPolicy], shared: SharedProfileSettings
+    ) -> str:
+        payload = {
+            "dwellSeconds": shared.dwell_seconds,
+            "materialUsageDeltaPct": shared.material_usage_delta_pct,
+            "slots": {
+                slot: {
+                    "fiveHourCeilingPct": policy.five_hour_ceiling_pct,
+                    "weeklyCeilingPct": policy.weekly_ceiling_pct,
+                    "priority": policy.priority,
+                }
+                for slot, policy in sorted(
+                    policies.items(), key=lambda item: int(item[0])
+                )
+            },
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def _shared_policies(
+        self, quarantined: set[str]
+    ) -> dict[str, SlotPolicy]:
+        explicit = load_slot_policies(self.switcher.backup_dir)
+        return {
+            slot: explicit.get(int(slot), DEFAULT_SLOT_POLICY)
+            for slot in self.switcher.switchable_account_numbers()
+            if slot not in quarantined
+            and self.switcher.account_kind_for(slot) != "api_key"
+        }
+
+    def _steady_controller(
+        self,
+        slot: str,
+        usage: dict,
+        policies: dict[str, SlotPolicy],
+        shared: SharedProfileSettings,
+    ) -> dict:
+        now = self.clock()
+        return {
+            "phase": "steady",
+            "activeSlot": slot,
+            "identity": self.switcher.account_identity(slot),
+            "policyRevision": self._policy_revision(policies, shared),
+            "activatedAt": now,
+            "dwellUntil": now + shared.dwell_seconds,
+            "activationUsage": usage,
+        }
+
+    def _store_controller(self, controller: dict) -> None:
+        if self.dry_run:
+            return
+
+        def update(state: dict) -> None:
+            state["sharedProfileController"] = controller
+
+        self._mutate_state(update)
+
+    def _tick_shared_profile(
+        self,
+        *,
+        current: str,
+        current_email: str,
+        state: dict,
+        shared: SharedProfileSettings,
+        quarantined: set[str],
+    ) -> TickOutcome:
+        controller = state.get("sharedProfileController")
+        if isinstance(controller, dict) and controller.get("phase") == "priming-pending":
+            self._emit(NoSwitchEvent(reason="priming-pending"))
+            return TickOutcome.NO_ACTION
+
+        policies = self._shared_policies(quarantined)
+        epoch_started = self.clock()
+        entries = self.switcher.usage_entries_by_account(fetch=set(policies))
+        usage = {
+            slot: entry.last_good
+            for slot, entry in entries.items()
+            if slot in policies
+            and entry.fetched_at is not None
+            and entry.fetched_at >= epoch_started
+            and entry.last_error is None
+            and isinstance(entry.last_good, dict)
+        }
+        ranked = rank_paced_slots(usage, policies, self.clock())
+        active_usage = usage.get(current)
+        active_eligible = (
+            current in policies
+            and active_usage is not None
+            and verified_eligible(active_usage, policies[current])
+        )
+        revision = self._policy_revision(policies, shared)
+        identity = self.switcher.account_identity(current)
+        identities = {
+            slot: self.switcher.account_identity(slot) for slot in policies
+        }
+        snapshot_revision = hashlib.sha256(
+            json.dumps(
+                {
+                    "epochStarted": epoch_started,
+                    "activeSlot": current,
+                    "policyRevision": revision,
+                    "identities": identities,
+                    "usage": usage,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        steady_valid = (
+            isinstance(controller, dict)
+            and controller.get("phase") == "steady"
+            and controller.get("activeSlot") == current
+            and controller.get("identity") == identity
+            and controller.get("policyRevision") == revision
+        )
+        if not steady_valid:
+            if active_eligible:
+                assert active_usage is not None
+                self._store_controller(
+                    self._steady_controller(current, active_usage, policies, shared)
+                )
+                self._emit(NoSwitchEvent(reason="controller-baseline"))
+                return TickOutcome.NO_ACTION
+
+        target = next((slot for slot in ranked if slot != current), None)
+        if target is None:
+            self._emit(NoSwitchEvent(reason="verification-blocked"))
+            return TickOutcome.BLOCKED
+
+        if active_eligible:
+            if ranked and ranked[0] == current:
+                self._emit(NoSwitchEvent(reason="paced-active"))
+                return TickOutcome.NO_ACTION
+            assert isinstance(controller, dict)
+            dwell_until = controller.get("dwellUntil")
+            if not isinstance(dwell_until, (int, float)) or self.clock() < dwell_until:
+                self._emit(NoSwitchEvent(reason="dwell"))
+                return TickOutcome.NO_ACTION
+            if not material_usage_changed(
+                controller.get("activationUsage"),
+                active_usage,
+                shared.material_usage_delta_pct,
+            ):
+                self._emit(NoSwitchEvent(reason="material-usage"))
+                return TickOutcome.NO_ACTION
+
+        return self._perform_shared_profile(
+            target=target,
+            expected_controller=controller,
+            expected_current=current,
+            expected_current_identity=self.switcher.account_identity(current),
+            expected_identities=identities,
+            snapshot_revision=snapshot_revision,
+            snapshot_usage=usage,
+            policies=policies,
+            shared=shared,
+            failover=not active_eligible,
+            current_email=current_email,
+        )
+
+    def _perform_shared_profile(
+        self,
+        *,
+        target: str,
+        expected_controller: dict | None,
+        expected_current: str,
+        expected_current_identity: dict,
+        expected_identities: dict[str, dict],
+        snapshot_revision: str,
+        snapshot_usage: dict[str, dict],
+        policies: dict[str, SlotPolicy],
+        shared: SharedProfileSettings,
+        failover: bool,
+        current_email: str,
+    ) -> TickOutcome:
+        if self.dry_run:
+            return self._perform(target, self.switcher.account_email(target), "paced")
+
+        committed_failover = failover
+        with self._state_lock():
+            state = self._read_state()
+            if state.get("sharedProfileController") != expected_controller:
+                self._emit(NoSwitchEvent(reason="controller-changed"))
+                return TickOutcome.NO_ACTION
+            current = self.switcher.current_account_number()
+            if current != expected_current or current == target:
+                self._emit(NoSwitchEvent(reason="controller-changed"))
+                return TickOutcome.NO_ACTION
+            state["schemaVersion"] = STATE_SCHEMA_VERSION
+            state["sharedProfileController"] = {
+                "phase": "selecting",
+                "reason": "failover" if failover else "paced",
+                "snapshotRevision": snapshot_revision,
+                "activeSlot": current,
+                "targetSlot": target,
+                "selectedAt": self.clock(),
+            }
+            atomic_write_json(self.state_path, state)
+
+            def abort(reason: str) -> TickOutcome:
+                if expected_controller is None:
+                    state.pop("sharedProfileController", None)
+                else:
+                    state["sharedProfileController"] = expected_controller
+                atomic_write_json(self.state_path, state)
+                self._emit(NoSwitchEvent(reason=reason))
+                return TickOutcome.NO_ACTION
+
+            locked_shared = load_shared_profile_settings(self.switcher.backup_dir)
+            locked_quarantine = state.get("quarantine")
+            locked_policies = self._shared_policies(
+                set(locked_quarantine)
+                if isinstance(locked_quarantine, dict)
+                else set()
+            )
+            if (
+                not locked_shared.enabled
+                or target not in locked_policies
+                or self._policy_revision(locked_policies, locked_shared)
+                != self._policy_revision(policies, shared)
+                or {
+                    slot: self.switcher.account_identity(slot)
+                    for slot in locked_policies
+                }
+                != expected_identities
+                or self.switcher.account_identity(current)
+                != expected_current_identity
+            ):
+                return abort("policy-changed")
+            status = self._freshen_target(
+                target, self.switcher.account_email(target)
+            )
+            if status != "ok":
+                return abort("target-freshen-failed")
+            locked_active_usage = self.switcher.fetch_usage_now(current)
+            locked_target_usage = self.switcher.fetch_usage_now(target)
+            if not verified_eligible(
+                locked_target_usage, locked_policies[target]
+            ):
+                return abort("target-recheck-ineligible")
+            assert isinstance(locked_target_usage, dict)
+            locked_usage_by_slot = dict(snapshot_usage)
+            locked_usage_by_slot[current] = locked_active_usage
+            locked_usage_by_slot[target] = locked_target_usage
+            locked_ranked = rank_paced_slots(
+                locked_usage_by_slot, locked_policies, self.clock()
+            )
+            if not locked_ranked or locked_ranked[0] != target:
+                return abort("ranking-changed")
+            locked_active_eligible = (
+                current in locked_policies
+                and verified_eligible(
+                    locked_active_usage, locked_policies[current]
+                )
+            )
+            committed_failover = not locked_active_eligible
+            if locked_active_eligible:
+                if not isinstance(expected_controller, dict):
+                    return abort("controller-changed")
+                dwell_until = expected_controller.get("dwellUntil")
+                if (
+                    not isinstance(dwell_until, (int, float))
+                    or self.clock() < dwell_until
+                ):
+                    return abort("dwell")
+                if not material_usage_changed(
+                    expected_controller.get("activationUsage"),
+                    locked_active_usage,
+                    locked_shared.material_usage_delta_pct,
+                ):
+                    return abort("material-usage")
+            result = self.switcher.switch_to(target, json_output=True)
+            if not result or not result.get("switched"):
+                return abort("already-active")
+            state["schemaVersion"] = STATE_SCHEMA_VERSION
+            state["lastSwitchAt"] = self.clock()
+            state["lastSwitchTo"] = target
+            state["sharedProfileController"] = self._steady_controller(
+                target, locked_target_usage, locked_policies, locked_shared
+            )
+            atomic_write_json(self.state_path, state)
+
+        self._emit(
+            SwitchEvent(
+                trigger="failover" if committed_failover else "paced",
+                from_ref=result.get("from")
+                or _ref(current, current_email),
+                to_ref=result.get("to"),
+                warnings=result.get("warnings", []),
+            )
+        )
+        return TickOutcome.SWITCHED
 
     def _rank_candidates(
         self,
