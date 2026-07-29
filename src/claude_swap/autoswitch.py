@@ -33,6 +33,7 @@ import enum
 import hashlib
 import json
 import logging
+import math
 import random
 import threading
 import time
@@ -364,6 +365,14 @@ class TickOutcome(enum.Enum):
     ERROR = 1
     NO_ACTION = 2
     BLOCKED = 3  # wanted to switch but no viable target / all exhausted
+
+
+@dataclass(frozen=True)
+class CappedRecovery:
+    """Complete current-epoch cap proof and its optional safe wake."""
+
+    all_capped: bool
+    wake_at: float | None = None
 
 
 # Quarantine state persisted fingerprints from a local refresh-token-only
@@ -1201,8 +1210,14 @@ class AutoSwitchEngine:
         usage: dict,
         policies: dict[str, SlotPolicy],
         shared: SharedProfileSettings,
+        *,
+        primed_slots: list[str] | None = None,
     ) -> dict:
         now = self.clock()
+        primed = sorted(
+            policies if primed_slots is None else primed_slots,
+            key=int,
+        )
         return {
             "phase": "steady",
             "activeSlot": slot,
@@ -1211,6 +1226,7 @@ class AutoSwitchEngine:
             "activatedAt": now,
             "dwellUntil": now + shared.dwell_seconds,
             "activationUsage": usage,
+            **self._priming_progress(primed),
         }
 
     def _store_controller(self, controller: dict) -> None:
@@ -1222,6 +1238,390 @@ class AutoSwitchEngine:
 
         self._mutate_state(update)
 
+    def _primed_slots(
+        self,
+        controller: object,
+        policies: dict[str, SlotPolicy],
+    ) -> list[str]:
+        if not isinstance(controller, dict):
+            return []
+        raw = controller.get("primedSlots")
+        if not isinstance(raw, list):
+            return []
+        primed = [
+            slot
+            for slot in raw
+            if isinstance(slot, str) and slot in policies
+        ]
+        recorded = controller.get("primedIdentities")
+        # ``priming-complete`` is the one migration marker used by the
+        # pre-priming controller tests. New operational state always binds a
+        # primed slot to its identity so a move/swap cannot inherit proof.
+        if not isinstance(recorded, dict):
+            return (
+                sorted(set(primed), key=int)
+                if controller.get("phase") == "priming-complete"
+                else []
+            )
+        return sorted(
+            {
+                slot
+                for slot in primed
+                if recorded.get(slot) == self.switcher.account_identity(slot)
+            },
+            key=int,
+        )
+
+    def _priming_progress(self, primed_slots: list[str]) -> dict:
+        return {
+            "primedSlots": primed_slots,
+            "primedIdentities": {
+                slot: self.switcher.account_identity(slot)
+                for slot in primed_slots
+            },
+        }
+
+    @staticmethod
+    def _five_hour_reset(usage: object) -> str | None:
+        if not isinstance(usage, dict):
+            return None
+        window = usage.get("five_hour")
+        if not isinstance(window, dict):
+            return None
+        value = window.get("resets_at")
+        return value if isinstance(value, str) else None
+
+    def _priming_controller(
+        self,
+        *,
+        slot: str,
+        baseline: dict,
+        policies: dict[str, SlotPolicy],
+        shared: SharedProfileSettings,
+        primed_slots: list[str],
+        baseline_failures: int,
+    ) -> dict:
+        now = self.clock()
+        return {
+            "phase": "priming-pending",
+            "activeSlot": slot,
+            "identity": self.switcher.account_identity(slot),
+            "policyRevision": self._policy_revision(policies, shared),
+            "baselineFiveHourResetAt": self._five_hour_reset(baseline),
+            "activatedAt": now,
+            "failedPolls": 0,
+            "lastFailedAttemptAt": None,
+            "observedStoreFailures": baseline_failures,
+            "escalated": False,
+            **self._priming_progress(primed_slots),
+        }
+
+    def _tick_priming_pending(
+        self,
+        controller: dict,
+        policies: dict[str, SlotPolicy],
+        shared: SharedProfileSettings,
+    ) -> TickOutcome:
+        slot = controller.get("activeSlot")
+        activated_at = controller.get("activatedAt")
+        # A #10-era placeholder may exist without the #11 proof fields.
+        # It is still a pin: preserve it without guessing a baseline or
+        # silently converting it into ordinary rotation.
+        if not isinstance(activated_at, (int, float)):
+            self._emit(NoSwitchEvent(reason="priming-pending"))
+            return TickOutcome.NO_ACTION
+        if (
+            not isinstance(slot, str)
+            or slot not in policies
+            or self.switcher.current_account_number() != slot
+            or controller.get("identity") != self.switcher.account_identity(slot)
+            or controller.get("policyRevision")
+            != self._policy_revision(policies, shared)
+        ):
+            self._emit(
+                NoSwitchEvent(
+                    reason="priming-pin-invalid",
+                    detail="retaining the current profile; operator reconciliation required",
+                )
+            )
+            return TickOutcome.BLOCKED
+
+        entries = self.switcher.usage_entries_by_account(fetch={slot})
+        entry = entries.get(slot)
+        if entry is None:
+            self._emit(NoSwitchEvent(reason="priming-pending"))
+            return TickOutcome.NO_ACTION
+
+        successful_after_activation = (
+            entry.last_error is None
+            and entry.fetched_at is not None
+            and entry.fetched_at > float(activated_at)
+            and isinstance(entry.last_good, dict)
+        )
+        if successful_after_activation:
+            fresh_reset = self._five_hour_reset(entry.last_good)
+            baseline_reset = controller.get("baselineFiveHourResetAt")
+            fresh_ts = _parse_reset_ts(fresh_reset)
+            baseline_ts = _parse_reset_ts(baseline_reset)
+            proved = fresh_ts is not None and (
+                baseline_ts is None or fresh_ts > baseline_ts
+            )
+            if proved:
+                primed = self._primed_slots(controller, policies)
+                if slot not in primed:
+                    primed.append(slot)
+                    primed.sort(key=int)
+                self._store_controller(
+                    {
+                        "phase": "priming",
+                        **self._priming_progress(primed),
+                    }
+                )
+                self._emit(
+                    NoSwitchEvent(
+                        reason="priming-confirmed",
+                        detail=f"rotating seat {slot} opened a fresh 5-hour window",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            if (
+                controller.get("failedPolls")
+                or controller.get("observedStoreFailures")
+                or controller.get("escalated")
+            ):
+                controller = {
+                    **controller,
+                    "failedPolls": 0,
+                    "observedStoreFailures": 0,
+                    "escalated": False,
+                }
+                self._store_controller(controller)
+            self._emit(NoSwitchEvent(reason="priming-pending"))
+            return TickOutcome.NO_ACTION
+
+        attempted_after_activation = (
+            entry.last_attempt_at is not None
+            and entry.last_attempt_at > float(activated_at)
+            and entry.last_error is not None
+        )
+        failures = int(controller.get("failedPolls", 0))
+        observed_store_failures = int(
+            controller.get("observedStoreFailures", 0)
+        )
+        new_store_failures = 0
+        if attempted_after_activation:
+            if entry.consecutive_failures > observed_store_failures:
+                new_store_failures = (
+                    entry.consecutive_failures - observed_store_failures
+                )
+            elif (
+                entry.consecutive_failures > 0
+                and entry.last_attempt_at
+                != controller.get("lastFailedAttemptAt")
+            ):
+                # A success reset the store counter between controller ticks,
+                # followed by a new failure.
+                new_store_failures = entry.consecutive_failures
+        failures += new_store_failures
+        escalated = failures >= self.settings.unhealthy_ticks
+        if (
+            failures != controller.get("failedPolls")
+            or escalated != controller.get("escalated")
+            or (
+                attempted_after_activation
+                and entry.consecutive_failures != observed_store_failures
+            )
+        ):
+            controller = {
+                **controller,
+                "failedPolls": failures,
+                "lastFailedAttemptAt": (
+                    entry.last_attempt_at
+                    if new_store_failures
+                    else controller.get("lastFailedAttemptAt")
+                ),
+                "observedStoreFailures": (
+                    entry.consecutive_failures
+                    if attempted_after_activation
+                    else observed_store_failures
+                ),
+                "escalated": escalated,
+            }
+            self._store_controller(controller)
+        if escalated:
+            self._emit(
+                ErrorEvent(
+                    message=(
+                        f"rotating seat {slot} priming proof poll failed "
+                        f"{failures} consecutive times; profile remains pinned"
+                    ),
+                    transient=True,
+                )
+            )
+            return TickOutcome.ERROR
+        self._emit(NoSwitchEvent(reason="priming-pending"))
+        return TickOutcome.NO_ACTION
+
+    def _begin_priming(
+        self,
+        *,
+        target: str,
+        current: str,
+        controller: dict | None,
+        snapshot_usage: dict[str, dict],
+        policies: dict[str, SlotPolicy],
+        shared: SharedProfileSettings,
+        primed_slots: list[str],
+        baseline_failures: int,
+        expected_identities: dict[str, dict],
+        current_email: str,
+    ) -> TickOutcome:
+        baseline = snapshot_usage.get(target)
+        if not verified_eligible(baseline, policies[target]):
+            self._emit(
+                NoSwitchEvent(
+                    reason="priming-baseline-unavailable",
+                    detail=(
+                        f"rotating seat {target} lacks fresh below-ceiling "
+                        "usage proof"
+                    ),
+                )
+            )
+            return TickOutcome.BLOCKED
+        assert isinstance(baseline, dict)
+        if self.dry_run:
+            self._emit(
+                NoSwitchEvent(
+                    reason="priming-pending",
+                    detail=(
+                        f"would pin rotating seat {target}; "
+                        "dry-run made no state change"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
+
+        result = None
+        with self._state_lock():
+            state = self._read_state()
+            if state.get("sharedProfileController") != controller:
+                self._emit(NoSwitchEvent(reason="controller-changed"))
+                return TickOutcome.NO_ACTION
+            locked_shared = load_shared_profile_settings(self.switcher.backup_dir)
+            locked_policies = self._shared_policies(
+                set(state.get("quarantine", {}))
+                if isinstance(state.get("quarantine"), dict)
+                else set()
+            )
+            if (
+                not locked_shared.enabled
+                or target not in locked_policies
+                or self._policy_revision(locked_policies, locked_shared)
+                != self._policy_revision(policies, shared)
+                or {
+                    slot: self.switcher.account_identity(slot)
+                    for slot in locked_policies
+                }
+                != expected_identities
+                or self.switcher.current_account_number() != current
+            ):
+                self._emit(NoSwitchEvent(reason="policy-changed"))
+                return TickOutcome.NO_ACTION
+            status = self._freshen_target(
+                target, self.switcher.account_email(target)
+            )
+            if status != "ok":
+                self._emit(NoSwitchEvent(reason="target-freshen-failed"))
+                return TickOutcome.NO_ACTION
+            locked_baseline = self.switcher.fetch_usage_now(target)
+            if not verified_eligible(locked_baseline, locked_policies[target]):
+                self._emit(NoSwitchEvent(reason="target-recheck-ineligible"))
+                return TickOutcome.NO_ACTION
+            assert isinstance(locked_baseline, dict)
+            baseline = locked_baseline
+            if target != current:
+                result = self.switcher.switch_to(target, json_output=True)
+                if not result or not result.get("switched"):
+                    self._emit(NoSwitchEvent(reason="already-active"))
+                    return TickOutcome.NO_ACTION
+            state["schemaVersion"] = STATE_SCHEMA_VERSION
+            state["sharedProfileController"] = self._priming_controller(
+                slot=target,
+                baseline=baseline,
+                policies=locked_policies,
+                shared=locked_shared,
+                primed_slots=primed_slots,
+                baseline_failures=baseline_failures,
+            )
+            atomic_write_json(self.state_path, state)
+
+        if result:
+            self._emit(
+                SwitchEvent(
+                    trigger="priming",
+                    from_ref=result.get("from") or _ref(current, current_email),
+                    to_ref=result.get("to"),
+                    warnings=result.get("warnings", []),
+                )
+            )
+        else:
+            self._emit(NoSwitchEvent(reason="priming-pending"))
+        return TickOutcome.SWITCHED if result else TickOutcome.NO_ACTION
+
+    @staticmethod
+    def _all_capped_recovery(
+        usage: dict[str, dict],
+        policies: dict[str, SlotPolicy],
+        now: float,
+    ) -> CappedRecovery:
+        if not policies:
+            return CappedRecovery(False)
+        recoveries: list[float | None] = []
+        for slot, policy in policies.items():
+            value = usage.get(slot)
+            if not isinstance(value, dict):
+                return CappedRecovery(False)
+            blocking_windows: list[dict] = []
+            for key, ceiling in (
+                ("five_hour", policy.five_hour_ceiling_pct),
+                ("seven_day", policy.weekly_ceiling_pct),
+            ):
+                window = value.get(key)
+                if not isinstance(window, dict):
+                    return CappedRecovery(False)
+                pct = window.get("pct")
+                if (
+                    isinstance(pct, bool)
+                    or not isinstance(pct, (int, float))
+                    or not math.isfinite(pct)
+                ):
+                    return CappedRecovery(False)
+                if float(pct) >= ceiling:
+                    blocking_windows.append(window)
+            if not blocking_windows:
+                return CappedRecovery(False)
+            blocking_resets = [
+                _parse_reset_ts(window.get("resets_at"))
+                for window in blocking_windows
+            ]
+            if any(reset is None or reset <= now for reset in blocking_resets):
+                recoveries.append(None)
+            else:
+                recoveries.append(
+                    max(
+                        reset
+                        for reset in blocking_resets
+                        if reset is not None
+                    )
+                )
+        if any(item is None for item in recoveries):
+            return CappedRecovery(True)
+        return CappedRecovery(
+            True,
+            min(item for item in recoveries if item is not None)
+            + RESET_SLACK_S,
+        )
+
     def _tick_shared_profile(
         self,
         *,
@@ -1232,11 +1632,13 @@ class AutoSwitchEngine:
         quarantined: set[str],
     ) -> TickOutcome:
         controller = state.get("sharedProfileController")
-        if isinstance(controller, dict) and controller.get("phase") == "priming-pending":
-            self._emit(NoSwitchEvent(reason="priming-pending"))
-            return TickOutcome.NO_ACTION
-
         policies = self._shared_policies(quarantined)
+        if (
+            isinstance(controller, dict)
+            and controller.get("phase") == "priming-pending"
+        ):
+            return self._tick_priming_pending(controller, policies, shared)
+
         epoch_started = self.clock()
         entries = self.switcher.usage_entries_by_account(fetch=set(policies))
         usage = {
@@ -1260,6 +1662,30 @@ class AutoSwitchEngine:
         identities = {
             slot: self.switcher.account_identity(slot) for slot in policies
         }
+        primed_slots = self._primed_slots(controller, policies)
+        unprimed = sorted(
+            (slot for slot in policies if slot not in primed_slots),
+            key=lambda slot: (-policies[slot].priority, int(slot)),
+        )
+        if unprimed:
+            baseline_entry = entries.get(unprimed[0])
+            return self._begin_priming(
+                target=unprimed[0],
+                current=current,
+                controller=controller if isinstance(controller, dict) else None,
+                snapshot_usage=usage,
+                policies=policies,
+                shared=shared,
+                primed_slots=primed_slots,
+                baseline_failures=(
+                    baseline_entry.consecutive_failures
+                    if baseline_entry is not None
+                    else 0
+                ),
+                expected_identities=identities,
+                current_email=current_email,
+            )
+
         snapshot_revision = hashlib.sha256(
             json.dumps(
                 {
@@ -1284,13 +1710,52 @@ class AutoSwitchEngine:
             if active_eligible:
                 assert active_usage is not None
                 self._store_controller(
-                    self._steady_controller(current, active_usage, policies, shared)
+                    self._steady_controller(
+                        current,
+                        active_usage,
+                        policies,
+                        shared,
+                        primed_slots=primed_slots,
+                    )
                 )
                 self._emit(NoSwitchEvent(reason="controller-baseline"))
                 return TickOutcome.NO_ACTION
 
         target = next((slot for slot in ranked if slot != current), None)
         if target is None:
+            if active_eligible:
+                self._emit(NoSwitchEvent(reason="paced-active"))
+                return TickOutcome.NO_ACTION
+            recovery = self._all_capped_recovery(
+                usage, policies, self.clock()
+            )
+            if recovery.all_capped:
+                proposed_park_slot = min(
+                    policies,
+                    key=lambda slot: (-policies[slot].priority, int(slot)),
+                )
+                blocked = {
+                    "phase": "verification-blocked",
+                    "reason": "worker-admission-hold-unavailable",
+                    "allCapped": True,
+                    "activeSlot": current,
+                    "proposedParkSlot": proposed_park_slot,
+                    "wakeAt": recovery.wake_at,
+                    "policyRevision": revision,
+                    **self._priming_progress(primed_slots),
+                }
+                self._store_controller(blocked)
+                self._emit(
+                    NoSwitchEvent(
+                        reason="worker-admission-hold-unavailable",
+                        detail=(
+                            "all rotating seats are freshly capped; retaining "
+                            f"rotating seat {current} instead of parking on "
+                            f"rotating seat {proposed_park_slot}"
+                        ),
+                    )
+                )
+                return TickOutcome.BLOCKED
             self._emit(NoSwitchEvent(reason="verification-blocked"))
             return TickOutcome.BLOCKED
 
@@ -1323,6 +1788,7 @@ class AutoSwitchEngine:
             shared=shared,
             failover=not active_eligible,
             current_email=current_email,
+            primed_slots=primed_slots,
         )
 
     def _perform_shared_profile(
@@ -1339,6 +1805,7 @@ class AutoSwitchEngine:
         shared: SharedProfileSettings,
         failover: bool,
         current_email: str,
+        primed_slots: list[str],
     ) -> TickOutcome:
         if self.dry_run:
             return self._perform(target, self.switcher.account_email(target), "paced")
@@ -1443,7 +1910,11 @@ class AutoSwitchEngine:
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = target
             state["sharedProfileController"] = self._steady_controller(
-                target, locked_target_usage, locked_policies, locked_shared
+                target,
+                locked_target_usage,
+                locked_policies,
+                locked_shared,
+                primed_slots=primed_slots,
             )
             atomic_write_json(self.state_path, state)
 
