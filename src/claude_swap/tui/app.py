@@ -40,6 +40,11 @@ class CswapApp(App):
     BINDINGS = [Binding("ctrl+t", "toggle_theme", "Theme")]
 
     POLL_INTERVAL_S = 3.0  # matches the old watch view's recapture cadence
+    # Snapshot age stays hidden while polling is healthy (age never exceeds
+    # ~POLL_INTERVAL_S); past this it surfaces as a staleness alarm. 60s also
+    # keeps format_duration in whole minutes, so the note never ticks per
+    # second.
+    SNAPSHOT_AGE_NOTE_S = 60.0
 
     snapshot: reactive[AccountsSnapshot | None] = reactive(None)
     refresh_status: reactive[str] = reactive("")
@@ -190,7 +195,8 @@ class CswapApp(App):
         now = time.time()
         if self.snapshot is not None:
             age = max(0.0, now - self.snapshot.taken_at)
-            parts.append(f"snapshot {format_duration(age)} ago")
+            if age >= self.SNAPSHOT_AGE_NOTE_S:
+                parts.append(f"snapshot {format_duration(age)} ago")
         if self._normal_refreshing and self._normal_started_at is not None:
             elapsed = now - self._normal_started_at
             if elapsed >= self.POLL_INTERVAL_S:

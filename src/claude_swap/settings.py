@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
 
 SETTINGS_SCHEMA_VERSION = 1
@@ -872,18 +873,39 @@ def atomic_write_json(path: Path, data: dict) -> None:
 
     Shared by settings.json and the autoswitch state file (and any future
     machine-local state files beside them).
+
+    **Writes THROUGH a symlink, never over it.** A rename swaps a directory
+    ENTRY and does not follow links, so renaming onto a symlinked path
+    DETACHES the link: the write succeeds, the content is right, and the
+    link target silently stops receiving updates — until something restores
+    the link (a dotfiles deploy), taking every change written since with
+    it. Same shape as #192/#193, which fixed ``session.py``'s own writer;
+    this is the shared JSON writer. Three consequences, each deliberate:
+
+    - A DANGLING link still writes where it points; linking a path is a
+      request to write there.
+    - The temp file is created beside the RESOLVED target, so the rename
+      stays on one filesystem and remains atomic (beside the LINK it would
+      hit EXDEV whenever the target lives on another mount).
+    - The 0700 hardening stays on the directory cswap owns. Applying it to
+      the resolved parent would narrow a directory belonging to something
+      else, and raise ``PermissionError`` outright when that parent is not
+      ours to chmod. The written file still gets 0600, and ``mkstemp``
+      creates it 0600 to begin with, so the secret is never exposed.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
+        # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
     try:
         os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
         os.close(fd)
         fd = -1
-        os.replace(tmp_path, str(path))
+        replace_with_retry(tmp_path, str(target))
         if sys.platform != "win32":
-            os.chmod(str(path), 0o600)
+            os.chmod(str(target), 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)

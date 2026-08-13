@@ -52,6 +52,8 @@ Log in with another account, then:
 cswap add
 ```
 
+Do not run `/logout` first: current Claude Code may revoke the refresh token stored for the account you are leaving.
+
 ### Switch accounts
 
 Rotate to the next account:
@@ -163,18 +165,6 @@ Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usag
 
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
-### Theme
-
-The TUI ships a dark theme and a light theme, both WCAG AA-contrast checked, plus `auto` (the default), which follows the terminal's background via an OSC 11 query. Pick one from the root menu's **Theme…** entry (the current one is marked), press `Ctrl+T` inside the TUI to cycle `dark → light → auto` live, or set it up front:
-
-```bash
-cswap config set ui.theme light   # or: dark, auto
-```
-
-The plain CLI output (outside the TUI) follows the same `ui.theme` setting. With `auto`, if the terminal doesn't answer the OSC 11 query, cswap falls back to the dark palette. Inside `tmux` or `screen` (which don't pass the query through) it skips the probe entirely and uses dark, so `auto` never adds a startup delay there.
-
-Toggling the theme live inside the TUI only affects new output — auto-view log lines already printed keep the colors they were written with; only lines added after the switch pick up the new theme.
-
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:
@@ -203,6 +193,8 @@ cswap alias 2 dev               # Give an account a short alias (usable anywhere
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
+cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
+cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
 cswap upgrade                   # Upgrade claude-swap to the latest version

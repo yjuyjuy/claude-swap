@@ -52,7 +52,7 @@ SCHEMA_VERSION = 2
 
 # Freshness is the reader's judgment per purpose, not a global TTL.
 # SERVE_TTL_S (re-exported from poll_policy — fresher than this → serve
-# without fetching) doubles as the per-token sustained-rate governor: see
+# without fetching) doubles as the per-account sustained-rate governor: see
 # poll_policy's module docstring for the measured budget it must stay under.
 STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 # Covers the bounded refresh + usage path, the full inventory's stagger, and
@@ -91,8 +91,9 @@ def _live_claim(
 TRUST_MAX_AGE_S = 3600.0
 
 # A usage-endpoint 429 is a polling throttle, not a change in the account's
-# real model quota: the endpoint budgets *usage requests* per token (see
-# poll_policy), independent of the 5h/7d limits it reports. It does NOT move
+# real model quota: the endpoint budgets *usage requests* (scope is
+# regime-dependent; see poll_policy), independent of the 5h/7d limits it
+# reports. It does NOT move
 # the account's real windows, and usage only rises within a window (monotone
 # until the window resets), so last_good is a valid lower bound on the true
 # usage right up to that reset. Trust it until then — data-driven, not a fixed
@@ -116,12 +117,14 @@ BACKOFF_CAP_S = 600.0
 # that is behaviour-preserving.
 BACKOFF_MAX_SHIFT = 32
 
-# The usage endpoint enforces a per-access-token request budget on
-# non-first-party User-Agents (proven 2026-07-11: an idle token, polling
-# alone trips it; poll_policy documents the measured shape — an hour-scale
-# rolling window, exact edge algorithm undocumented). Cumulative polling from
-# cswap's own surfaces is exactly what saturates it. Retry-After tells the
-# rules apart:
+# The usage endpoint enforces a request budget on non-first-party
+# User-Agents (proven 2026-07-11: an idle token, polling alone trips it;
+# poll_policy documents the measured shape — an hour-scale window, exact edge
+# algorithm undocumented). Nothing below depends on whether the budget is
+# scoped to the account/org or to the token — the wait comes from the
+# server's own deadline either way. Cumulative polling from cswap's own
+# surfaces is what saturates it.
+# Retry-After tells the rules apart:
 # - "Retry-After: 0" = the saturated-budget edge: the trailing hour's budget
 #   is spent and frees only as old requests age out, so immediate retries
 #   mostly prolong the oscillating state. Wait at least
@@ -140,7 +143,75 @@ BACKOFF_MAX_SHIFT = 32
 # let recover, with no benefit. Honoring the whole Retry-After spends one
 # request per block instead. The cap still bounds a pathological header to one
 # window, never hours.
-RETRY_AFTER_FLOOR_CAP_S = 3600.0
+#
+# Honoring it EXACTLY is not enough: the retry lands ON the deadline, where
+# the server is not reliably ready. Measured over this machine's whole log
+# (re-measured 2026-08-03, round 8 — the round-7 "21 of 36"/"2 of 38" figures
+# do reproduce under the method below, on the OTHER of its two valid
+# readings; round 8 switched readings, see the METHOD paragraph below for
+# which and why the two differ; these figures age as the log grows —
+# re-derive rather than trust them verbatim, using the method below), 20 of
+# 35 lapses re-blocked within 900s
+# of their own deadline (+2s..+887s), each earning a fresh full hour; the
+# next one is +1004s, so the distribution is bimodal and 900s is the edge of
+# the band — with only 13s of clearance (900 - 887), not the 185s an earlier,
+# wrong figure implied. ("20 of 35", not "of 38": the denominator is
+# restricted to the 35 POSITIVE lapse gaps, matching the numerator — 3 of the
+# 38 raw gaps are negative, and mixing them into an "of 38" denominator
+# understates the fraction. The negative gaps are NOT a uniform mechanism —
+# measured per gap: acct2 block10→11 (no within-block revision at all, a
+# single-observation block whose NEXT block's opening simply lands later);
+# block11→12 (the deadline was revised BACKWARD 903s mid-block, the opposite
+# of "forward"); block12→13 (deadline unchanged mid-block). None is a forward
+# revision. What they share is only the effect, not the cause: each next
+# block's opening observation lands before the prior block's own deadline —
+# a real event, just not a lapse to measure. Excluding them from a lapse-gap
+# analysis is still correct on that basis: a block that never lapsed has no
+# lapse gap.) The margin is
+# ABSOLUTE, not a fraction of the ask: Retry-After counts down to a fixed
+# deadline, so a machine polling into a block another one opened sees only
+# the remainder, and a fraction of that shrinks toward zero exactly when it
+# matters.
+#
+# METHOD (re-derive with this, not ad hoc, to get the same numbers): parse
+# ``claude-swap.log`` lines "Usage fetch failed for account N: http-429,
+# retry-after Ks"; EXCLUDE K == 0 (the saturated-budget edge above, a
+# different rule from the burst block this margin is sized against — 439 such
+# lines in the 2026-08-03 log, and mixing them into the block counts is what
+# produced the earlier wrong figures); group the remaining events per account
+# into blocks by clustering on the deadline ``ts + K`` (a new block opens when
+# the deadline jumps forward past a tolerance — stable for any tolerance from
+# 5s to 300s). 41 blocks result, 40 of them opened at exactly K=3600; 34 of
+# 75 observations land mid-block (not block-opening); the lapse gap is each
+# block's next observation's timestamp minus the PRIOR block's deadline —
+# where a block has more than one observation (a mid-block deadline
+# revision), "the block's deadline" means its OPENING observation's deadline
+# — the reading used below and the same one "40 of them opened at exactly
+# K=3600" reads, so every figure in this comment stays internally consistent
+# on one reading. Picking the block's LAST observation's deadline instead
+# does NOT fail to reproduce: it is equally stable at every tolerance from 5s
+# to 900s and gives "21 of 36"/"2 of 38", the figures this comment used to
+# carry before round 8. The two readings differ on exactly ONE gap (acct2
+# block11→12): its opening observation asks K=3600, but two later
+# observations in the same block report a deadline 903s EARLIER, so OPENING
+# reads that gap as -900.1s (excluded, negative) while LAST reads it as
+# +3.0s (included, a lapse inside the band). Either reading sizes the
+# constant identically — both put the band edge at +887s, so
+# RETRY_AFTER_MARGIN_S = 900 clears it with 13s to spare under both.
+RETRY_AFTER_MARGIN_S = 900.0
+# Bounds Retry-After + MARGIN_S, so a pathological header still cannot park an
+# account for hours. Sized to clear the measured shape: 40 of 41 observed
+# blocks opened at exactly 3600 (re-measured 2026-08-03, method above), and
+# 3600 + 900 = this. At an ask of exactly this value the margin is already
+# fully eaten, and beyond it the wait is SHORTER than the server asked — a
+# guaranteed 429, costing one request rather than a fresh hour (probing does
+# not re-arm a block). Above 3600 the cap eats
+# the margin (a 3700s ask keeps only +800s), which is deliberate — an ask past
+# the measured window is already outside the evidence, and bounding it matters
+# more there than preserving a margin derived from hour-scale blocks. If real
+# blocks ever open above 3600, raise this with the shape rather than letting
+# the cap silently shorten the margin.
+RETRY_AFTER_FLOOR_CAP_S = 4500.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
 # e.g. "Refresh token not found or invalid") can never recover on its own —
@@ -183,6 +254,14 @@ class FetchRecord:
     error: str | None = None
     retry_after_s: float | None = None
     sentinel: str | None = None
+    # Fingerprint of the credential whose refresh token was POSTed when a
+    # permanent auth error came back. Strikes bind to it: token_dead() holds
+    # only while the stored credential still fingerprints to the struck
+    # generation, so any credential-writing path heals the strike without a
+    # bespoke clear call. None on non-auth outcomes (and from writers that
+    # predate the field — those strikes bind unconditionally, the legacy
+    # behavior).
+    struck_fp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -212,6 +291,9 @@ class UsageEntry:
     # Consecutive permanent-auth failures (``invalid_grant``). At or above
     # AUTH_DEAD_STRIKES the token is treated as dead: see ``token_dead``.
     auth_dead_strikes: int = 0
+    # Fingerprint of the generation the strikes condemned (absent on legacy
+    # rows → strikes bind unconditionally). See ``token_dead``.
+    struck_fingerprint: str | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the server is refusing fresher data (failure state), or the
     # scheduler itself chose the cadence (within nextPollAt). Capped at
@@ -263,14 +345,33 @@ class UsageEntry:
         """Whether another collector's bounded fetch lease is still live."""
         return _live_claim(self.claim_until, self.last_attempt_at, now)
 
-    def token_dead(self, threshold: int = AUTH_DEAD_STRIKES) -> bool:
+    def token_dead(
+        self,
+        threshold: int = AUTH_DEAD_STRIKES,
+        stored_fp: str | None = None,
+    ) -> bool:
         """Whether the stored credential's refresh-token lineage is provably dead.
 
         True once ``invalid_grant`` has recurred ``threshold`` times without an
         intervening success. Such an account is quarantined: not fetched (see
         ``due_candidate`` and the collector) and surfaced as "re-login needed".
+
+        Strikes condemn the GENERATION that was POSTed, not the slot: when
+        the caller passes the currently-stored credential's fingerprint and
+        it differs from the struck one, the credential has been replaced
+        since the verdict — the strike no longer applies (any writing path
+        heals it, mirroring #142's identity-not-slot rule). A row struck
+        before fingerprints were recorded binds unconditionally.
         """
-        return self.auth_dead_strikes >= threshold
+        if self.auth_dead_strikes < threshold:
+            return False
+        if (
+            stored_fp is not None
+            and self.struck_fingerprint is not None
+            and stored_fp != self.struck_fingerprint
+        ):
+            return False
+        return True
 
     def decision_value(self) -> dict | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
@@ -363,6 +464,23 @@ def due_candidate(
     return due[0][2]
 
 
+def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> float | None:
+    """Epoch of the soonest relevant window to roll over, or None if unknown.
+
+    The soonest one is what matters: once it resets, usage there is zeroed and
+    the whole snapshot is obsolete, so a later window cannot rescue it. Windows
+    carrying no ``resets_at`` contribute nothing rather than a guess. A
+    non-dict ``last_good`` needs no guard here: ``oauth.relevant_windows``
+    already returns ``[]`` for any non-dict input.
+    """
+    resets = [
+        ts
+        for _, _, resets_at in oauth.relevant_windows(last_good, models)
+        if (ts := parse_reset_ts(resets_at)) is not None
+    ]
+    return min(resets) if resets else None
+
+
 def _rate_limited_trust_ok(
     last_good: dict | None,
     age_s: float | None,
@@ -397,24 +515,19 @@ def _rate_limited_trust_ok(
     if age_s is None:
         return False
     ceiling = now + (RATE_LIMIT_TRUST_MAX_AGE_S - age_s)
-    windows = (
-        oauth.relevant_windows(last_good, models)
-        if last_good is not None
-        else []
-    )
-    resets = [
-        ts
-        for _, _, resets_at in windows
-        if (ts := parse_reset_ts(resets_at)) is not None
-    ]
-    if resets:
-        # The soonest window to roll over invalidates the snapshot; never trust
-        # past it, and never past the client-side ceiling.
-        return now < min(min(resets), ceiling)
-    return now < ceiling
+    soonest = _earliest_reset(last_good, models)
+    # The soonest window to roll over invalidates the snapshot; never trust past
+    # it, and never past the client-side ceiling.
+    return now < (min(soonest, ceiling) if soonest is not None else ceiling)
 
 
-def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -> float:
+def _failure_backoff_s(
+    consecutive_failures: int,
+    retry_after_s: float | None,
+    *,
+    rate_limited: bool = True,
+) -> float:
+    """Seconds to stay in backoff after a failed fetch."""
     computed = min(
         BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), BACKOFF_MAX_SHIFT)),
         BACKOFF_CAP_S,
@@ -422,11 +535,283 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
     if retry_after_s is None:
         return computed
     if retry_after_s == 0:
+        if not rate_limited:
+            # `Retry-After: 0` on a non-429 (e.g. a Cloudflare 503 saying
+            # "retry now") is not the saturated-budget edge — that rule was
+            # measured on the usage endpoint's 429s only (poll_policy
+            # docstring; see the ceiling discussion above). Fall through to
+            # the plain exponential curve, same as no header at all.
+            return computed
         # Saturated-budget edge: wait before probing again.
         return min(max(computed, EDGE_BACKOFF_S), BACKOFF_CAP_S)
-    # Burst rule: wait at least what the server asked (up to the safety cap);
-    # our own curve may wait longer.
-    return max(min(retry_after_s, RETRY_AFTER_FLOOR_CAP_S), computed)
+    # Burst rule: the server's ask plus a margin (bounded by the cap); our own
+    # curve may still wait longer. Only above BACKOFF_CAP_S, because a short
+    # ask was separately measured as ACCURATE — not because the curve
+    # out-waits it. It does not: at `failures=1` computed is 30s, so a 300s ask
+    # lands exactly on the server's deadline, and the claim only becomes true
+    # at `failures=6` where computed reaches the cap. Strict: an ask OF exactly
+    # BACKOFF_CAP_S is what the saturated curve already waits.
+    #
+    # RESIDUE: an hour-scale block whose REMAINDER falls under BACKOFF_CAP_S
+    # takes no margin and still retries near its deadline. Nothing local
+    # separates that ask from a genuine short burst block, so it is left open.
+    asked = retry_after_s
+    # `rate_limited` gates ONLY the margin below — whether evidence measured
+    # on usage-endpoint 429 blocks applies here. It does NOT gate the PARK
+    # BOUND a few lines down, which applies to every ask unconditionally.
+    # Before this bound was restored, the cap lived inside this same `if`
+    # (`min(ask + margin, CAP)`), so `rate_limited` silently answered two
+    # unrelated questions — "does the measured margin evidence apply" and
+    # "may this ask park a row for a day" — through one flag. Separating them
+    # is why the bound is now its own unconditional statement below.
+    if retry_after_s > BACKOFF_CAP_S and rate_limited:
+        # THE MARGIN IS 429-ONLY, and the ceiling is why. It was measured on
+        # usage-endpoint blocks, whose stale data stays decision-trusted until
+        # `min(earliest relevant-window reset, fetched_at +
+        # RATE_LIMIT_TRUST_MAX_AGE_S)` — not the age-ceiling alone. A window
+        # that resets before the ceiling ends trust first, so the 4500s wait
+        # does NOT always sit inside its own trust: an earlier reset can leave
+        # the row un-pollable (still in backoff) and unknown (trust expired)
+        # for the remainder of the wait — see
+        # `test_a_soon_resetting_window_can_end_trust_before_the_429_wait_releases`.
+        #
+        # AND THE EARLY RESET IS ONLY ONE WAY IN. The age-ceiling half opens
+        # the same gap with no early reset at all, because `record()` writes
+        # `fetchedAt` on SUCCESS only: a chain of failed blocks keeps measuring
+        # trust from the first success while each block adds another full wait.
+        # Measured with far-future resets only, so only the ceiling can bind:
+        #
+        #     block 1  wait [    0,  4500]  trust ends 7200  blind      0s
+        #     block 2  wait [ 4500,  9000]  trust ends 7200  blind   1800s
+        #     block 3  wait [ 9000, 13500]  trust ends 7200  blind   4500s
+        #
+        # So the gap is bounded PER BLOCK and not across a chain — by block 3
+        # the row is blind for the whole wait. That is the tradeoff this margin
+        # makes in exchange for fewer requests, and it is worth stating at its
+        # true size rather than as a single-block figure.
+        #
+        # WHAT ACTUALLY BOUNDS IT is the identity `cap == 3600 + MARGIN` in
+        # `test_the_cap_sits_inside_the_trust_it_relies_on`, NOT the
+        # `cap <= RATE_LIMIT_TRUST_MAX_AGE_S` inequality that test also states.
+        # The inequality admits [4500, 7200], and at 7200 an ask of 6300s or
+        # more pushes the wait itself to 7200, taking the same three blocks
+        # from 6300s to 14400s blind (2.3x). Reason about this from blind
+        # time; the constant comparison does not imply it. Pinned by
+        # `test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success`.
+        #
+        # Every other failure falls back to TRUST_MAX_AGE_S = 3600s — and
+        # `_classify_usage_error` parses Retry-After for ANY HTTPError code,
+        # not just 429. A 503 carrying `Retry-After: 3600` therefore took the
+        # margin and waited 4500s while its last_good went untrusted at 3600s:
+        # 900s in which the row can neither be re-polled (still in backoff) nor
+        # used (unknown), and the unhealthy-tick counter reads that blindness
+        # as a failing account and fails over. Measured: blind window 179s ->
+        # 1079s, and (at a 120s tick interval, 3 unhealthy ticks) a failover
+        # at +3781s that main never performs.
+        #
+        # Capping the constant instead would land a 3600s ask exactly on its
+        # deadline — the defect this whole change exists to fix.
+        #
+        # No cap here: `min(x, RETRY_AFTER_FLOOR_CAP_S)` would be redundant
+        # with the PARK BOUND below, which still applies
+        # `RETRY_AFTER_FLOOR_CAP_S` unconditionally on this (`rate_limited`)
+        # arm — `min(min(x, c), c) == min(x, c)`. Re-verified after B1 (the
+        # PARK BOUND split by arm): still dead, because this branch is only
+        # reached when `rate_limited` is True, and that is exactly the arm
+        # the PARK BOUND still caps at `RETRY_AFTER_FLOOR_CAP_S`. Confirmed
+        # by mutation: adding it back (`min(x, RETRY_AFTER_FLOOR_CAP_S)`
+        # around the line below) survives the full suite.
+        asked = retry_after_s + RETRY_AFTER_MARGIN_S
+    # PARK BOUND — every ask is capped, but by the ceiling ITS OWN arm's trust
+    # actually uses, not a single shared constant. This restores nothing about
+    # trust: `entries()` still reads the row unknown once the relevant ceiling
+    # elapses past the last SUCCESS, exactly as before this line, so a capped
+    # ask can still be released un-pollable and unknown together. What this
+    # bounds is the PARK itself — how long the row can be held un-pollable —
+    # not whether it is trusted at the end of it.
+    #
+    # Without it BOTH arms are at risk of outliving their own trust:
+    # `_classify_usage_error` (oauth.py) parses Retry-After for ANY HTTPError
+    # code, not just 429, and the usage endpoint sits behind Cloudflare, which
+    # emits Retry-After on 503s as routine overload signaling. Measured: a
+    # `503 Retry-After: 86400` parks the row 24h, and `Retry-After: inf`
+    # (Python parses "inf", "Infinity", and any overflow literal like "1e400"
+    # to `float('inf')`) wedges the row permanently — `json.dumps` writes the
+    # non-standard `Infinity` literal, which survives a restart.
+    #
+    # A PRIOR REVISION reused RETRY_AFTER_FLOOR_CAP_S (4500) for both arms,
+    # reasoning "one answer to how long any ask can park a row". That is
+    # wrong for the non-429 arm: `entries()` reads a non-429 row unknown once
+    # TRUST_MAX_AGE_S (3600) elapses past the last success, not
+    # RETRY_AFTER_FLOOR_CAP_S — so a non-429 ask above 3600 parked the row
+    # 900s past its own trust: blind (un-pollable AND unknown) for that whole
+    # margin. See `test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses`.
+    # The 429 arm keeps RETRY_AFTER_FLOOR_CAP_S (4500), correctly inside its
+    # own ceiling RATE_LIMIT_TRUST_MAX_AGE_S (7200).
+    #
+    # CORRECTED 2026-08-03 — the line above does NOT close the blind window
+    # in general, on either arm, and an earlier version of this comment
+    # wrongly claimed it did ("a regression this PR introduced against
+    # upstream/main ... the blind window was always 0"). That is false,
+    # measured. The bound below compares the wrong pair of quantities:
+    # `asked` is a DURATION measured from the FAILURE (now), but the ceiling
+    # it is capped against (`RETRY_AFTER_FLOOR_CAP_S` / `TRUST_MAX_AGE_S`) is
+    # an AGE measured from the last SUCCESS (`fetchedAt`), which `entries()`
+    # actually uses. Those agree only when the row was already fresh (age 0)
+    # at the moment it failed. On the arm measured directly below (non-429,
+    # whose park cap equals the trust ceiling it is checked against) the gap
+    # reduces to the row's AGE AT FAILURE, up to the whole park — but that is
+    # an ARM-SPECIFIC coincidence, not the general rule: see the general
+    # closed form and the 429-arm numbers further down, where cap and
+    # ceiling are different constants and the identity does not hold.
+    # Measured end-to-end through `store.record()` / `entries().decision_
+    # value()`, with a control (row already fresh at failure -> no gap):
+    #
+    #  age@fail     ask    park   blind  starts  verdict
+    #         0    5000    3600       0    None  ok      <- CONTROL
+    #         1    5000    3600       0    None  ok
+    #       120    5000    3600     119  3481.0  blind
+    #       300    5000    3600     299  3301.0  blind
+    #      1800    5000    3600    1799  1801.0  blind
+    #      3599    5000    3600    3598     2.0  blind
+    #       300    4000    3600     299  3301.0  blind
+    #       300    3600    3600     299  3301.0  blind
+    #       300     600     600       0    None  ok
+    #
+    # Blind = the row is in backoff (un-pollable) AND `decision_value()` is
+    # None (unknown) at the same instant. Every row above is the non-429
+    # (`rate_limited=False`) arm, where the park cap equals TRUST_MAX_AGE_S
+    # (3600) exactly — the ask=4000/3600 rows show the SAME park (3600) as
+    # ask=5000 once the ask exceeds the ceiling, and ask=600 shows a park
+    # shorter than the ceiling never goes blind at all (its own curve is the
+    # binding constraint, not the ceiling). On THIS ARM, and only this arm,
+    # "the blind window equals the age at failure" holds — because the cap
+    # (TRUST_MAX_AGE_S) and the trust ceiling `entries()` actually reads
+    # against (also TRUST_MAX_AGE_S) are the SAME constant, so they cancel.
+    # General form, both arms: `blind = age_at_fail - (ceiling - park)`,
+    # where `ceiling` is RATE_LIMIT_TRUST_MAX_AGE_S (7200) on the 429 arm and
+    # TRUST_MAX_AGE_S (3600) on the non-429 arm above. It equals the age at
+    # failure only where `ceiling == park`, which is true on the non-429 arm
+    # (3600 == 3600) and false on the 429 arm (7200 != 4500).
+    #
+    # CORRECTED 2026-08-03 (round 8) — the paragraph that used to sit here
+    # said this is "PRE-EXISTING, not a regression this PR introduced",
+    # backed by a byte-identical table against a real upstream/main
+    # worktree. Both halves are true and together prove nothing about this
+    # PR: the table above is entirely the non-429 arm, whose cap
+    # (TRUST_MAX_AGE_S = 3600) this PR does not touch — of course it is
+    # byte-identical to upstream, whose non-429 cap is also 3600. The arm
+    # this PR DOES change is the 429 arm (RETRY_AFTER_FLOOR_CAP_S: upstream
+    # 3600 -> this PR's 4500), and there the blind window regresses. Same
+    # probe, `error="http-429"`, ask=3600 (so the margin-adjusted ask always
+    # exceeds the cap on both trees):
+    #
+    #  age@fail   PR park  PR blind   upstream park  upstream blind
+    #         0      4500         0            3600               0
+    #      2701      4500         1            3600               0   <- +1s
+    #      3600      4500       900            3600               0   <- +900s
+    #      5000      4500      2300            3600            1400   <- +900s
+    #
+    # Onset moves from age 3600 (upstream) to age 2700 (this PR) — 900s
+    # earlier — and every age past onset is a flat +900s worse than
+    # upstream. This is reachable with no contrived staleness: after one 429
+    # block the row's age at the next failure IS the park length, so a real
+    # chain of blocks compounds it (see `test_park_bound_blind_window_
+    # equals_age_at_failure`'s 429-arm cases and the DECISION note below).
+    # `autoswitch.py` reads a blind row as `active_headroom is None` and
+    # turns it into failover pressure — the exact downstream consequence
+    # round 6 was written to remove, and on the 429 arm this PR makes it
+    # worse than upstream, not merely pre-existing.
+    #
+    # DECISION: left open in this PR, not closed, WITH the true 429 numbers
+    # above (not the ones an earlier round of this comment cited).
+    #
+    # CORRECTED 2026-08-03 (round 10) — this block used to defer the fix on
+    # the claim that it "needs `_failure_backoff_s` to know the row's age at
+    # the moment it failed — a real signature change" that "ripples well
+    # past this bound". That is false, measured: `record()` already computes
+    # `row["backoffUntil"] = now + _failure_backoff_s(...)` at the one call
+    # site (usage_store.py, in `record()`'s failure branch) and already
+    # holds `fetchedAt` in the same row. Clamping the PRODUCT there —
+    # `min(now + _failure_backoff_s(...), fetchedAt + ceiling)` — needs no
+    # change to this function's signature and touches none of the tests that
+    # call it directly:
+    #
+    #   as shipped                                       :  park 4500s  blind  900s
+    #   call-site clamp min(now+wait, fetchedAt+ceiling)  :  park 3600s  blind    0s
+    #   _failure_backoff_s signature UNCHANGED             :  4500s still returned
+    #
+    # The real reason to keep this open is the one below, not the signature
+    # claim: that call-site clamp is the SAME trim NO TRUST TRIM AGAINST THE
+    # SERVER'S DEADLINE (a few lines down) spent a full section arguing
+    # against removing — it bounds `backoffUntil` against
+    # `fetchedAt + ceiling`, exactly the quantity that section calls a no-op-
+    # or-futile clip. Measured driving one 3600s block at three row ages:
+    #
+    #   age@open=0     AS SHIPPED 1 request, lands deadline+900s
+    #                  CLAMPED    1 request, lands deadline+900s   <- no-op, matches the trim's own finding
+    #   age@open=3600  AS SHIPPED 1 request, lands deadline+900s
+    #                  CLAMPED    1 request, lands deadline+0s     <- lands ON the deadline: the defect this PR fixes
+    #   age@open=7000  AS SHIPPED 1 request, lands deadline+900s
+    #                  CLAMPED    many requests, does not cleanly converge  <- the request storm the trim section measured
+    #
+    # So the clamp is not a smaller, safer version of the removed trim — past
+    # the ceiling it reproduces the same request-storm failure mode that trim
+    # was measured to cause, with the same ceiling. A follow-up landing this
+    # needs the same episode measurement the trim section did before it can
+    # ship, not merely a signature check. Tracked as a follow-up, not fixed
+    # here.
+    asked = min(asked, RETRY_AFTER_FLOOR_CAP_S if rate_limited else TRUST_MAX_AGE_S)
+    # NO TRUST TRIM AGAINST THE SERVER'S DEADLINE. Cutting a 429 wait back to
+    # the deadline when the stored trust expires first cannot salvage that
+    # trust — `trust < ask` is its own precondition and the floor keeps
+    # `wait >= ask`, so the row is untrusted at release either way (measured:
+    # fired 35 of 180 offsets, salvaged 0). It only lands us on the deadline,
+    # where 10 of 19 lapses re-block for a fresh hour (as measured when this
+    # was derived — the re-block fraction has since moved to 20 of 35
+    # (re-measured 2026-08-03, method corrected round 8: see
+    # RETRY_AFTER_MARGIN_S); the episode model below is not re-derived at the
+    # new fraction, since it concerns the removed 429 trust-trim and is out
+    # of the live path).
+    # Episode model on the original number, 3600 runs:
+    #
+    #     with the trim    blind 1148s   requests 1.21
+    #     without it       blind  550s   requests 1.00
+    #
+    # NOR AGAINST OUR OWN. A previous round clipped the wait to the row's
+    # remaining trust, reading `min(earliest reset, fetchedAt + ceiling)` as a
+    # second, independent deadline. It is not one, for two reasons.
+    #
+    # The clip is a no-op or it is futile, with no third case. Where
+    # `trust_left >= wait` it changes nothing; where `trust_left < wait` it
+    # returns `max(trust_left, computed) >= trust_left`, so the row is unknown
+    # at release by construction — "still trusted at release" would need
+    # `release < trust_left`, which that same expression forbids. Enumerated
+    # over every positive ask and every reachable `trust_left`: 12,188,000
+    # evaluations, 5,616,144 shortened a wait, 0 released with the row trusted.
+    #
+    # And the wait cannot move the deadline it was clipping against.
+    # `entries()` decides trust from `lastGood`/`fetchedAt`, which `record()`
+    # writes in the SUCCESS branch only — a 429 refreshes neither. So the
+    # instant the row goes unknown is fixed by the last successful fetch, and a
+    # shorter wait only samples that same instant more often, one request each.
+    # Un-pollable and unknown are independent axes; the previous round treated
+    # them as one window and tried to close the second by shortening the first.
+    #
+    # What the clip cost, measured over reset offsets 1..7200s against a 3600s
+    # block (requests spent inside the block, and seconds unknown before a poll
+    # could next succeed):
+    #
+    #     clipped     3.95 requests (worst 10)   73525s
+    #     unclipped   1.00 requests (worst  1)    1406s
+    #
+    # Worse on both axes, because the usage endpoint's 429 is a REQUEST-RATE
+    # block, not a quota-window one: `poll_policy` measured ~28-30 requests
+    # per trailing hour per budget identity, where "capacity returns only as
+    # old requests age out". A 5h/7d/scoped reset is a different axis and cannot lift it,
+    # while every extra retry is itself a request in that trailing hour — so
+    # the retries push out the very horizon they are retrying against.
+    return max(asked, computed)
 
 
 class UsageStore:
@@ -551,6 +936,7 @@ class UsageStore:
                 poll_interval_s=_num_or_none(row.get("pollIntervalS")),
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
+                struck_fingerprint=row.get("struckFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
             )
@@ -708,13 +1094,20 @@ class UsageStore:
                     # cadence while a 429 is recent (see UsageEntry.last_429_at).
                     row["last429At"] = now
                 row["backoffUntil"] = now + _failure_backoff_s(
-                    failures, rec.retry_after_s
+                    failures,
+                    rec.retry_after_s,
+                    rate_limited=rec.error == "http-429",
                 )
                 # Only a permanent-auth failure advances the dead-token count; a
                 # transient error (429/timeout) leaves it as-is — it is no
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
+                    # Additive field (absent/None = legacy unconditional
+                    # binding). Always overwrite: a legacy writer's strike
+                    # must bind unconditionally, not inherit a stale
+                    # fingerprint from an earlier, already-healed strike.
+                    row["struckFingerprint"] = rec.struck_fp
 
         with self._lock():
             rows = self._read_rows()
@@ -781,6 +1174,7 @@ class UsageStore:
             row["claimId"] = None
             row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
+            row["struckFingerprint"] = None
             row["consecutiveFailures"] = 0
             row["lastError"] = None
             row["backoffUntil"] = None
