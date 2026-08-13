@@ -37,7 +37,7 @@ import math
 import random
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,6 +75,30 @@ STATE_SCHEMA_VERSION = 1
 
 _logger = logging.getLogger("claude-swap")
 
+# Systemic freshen refusals, MOST ACTIONABLE FIRST. Deterministic conditions
+# that every candidate hits identically, so the tick reports one of them —
+# and the order decides which, because reporting the wrong one is how a cause
+# needing a human hides behind one that clears itself. store-unmirrored and
+# invalid_client stay until somebody unsets an env var or fixes a client
+# registration, and stash-unreadable until they unlock a keychain, fix a mode,
+# or purge the row; consume-busy is gone by the next pass. stash-unreadable is
+# the one that is per-SLOT rather than global, which costs nothing here: this
+# message is only ever emitted when NO candidate freshened, so naming the real
+# cause of the only slot that had one beats "(network?)".
+_SYSTEMIC_MESSAGES = {
+    "store-unmirrored": "CLAUDE_SECURESTORAGE_CONFIG_DIR is set — unset it or "
+                        "run cswap from a normal shell",
+    "invalid_client": "cswap's OAuth client was rejected — systemic, not this "
+                      "account",
+    "stash-unreadable": "a stashed successor is unreadable — unlock the "
+                        "keychain or fix the file, then retry; "
+                        "`cswap unclaimed` inspects it",
+    "consume-busy": "another cswap surface holds the slot — retries next pass",
+}
+# Insertion order IS the precedence order, so the remedy and its rank cannot
+# drift apart.
+_SYSTEMIC_STATUSES = tuple(_SYSTEMIC_MESSAGES)
+
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
 # expired" re-read holds with margin after our swap.
@@ -94,14 +118,142 @@ NO_RESET_FALLBACK_S = 300.0
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
 
-# Wedge-breaker: at or above this binding-window utilization the active
-# account is effectively unusable, so force an at-limit switch (which skips
-# the healthy-landing gate and takes any live account) even when the normal
-# per-window thresholds or the consume-first landing filter would find no
-# qualifying target. Without it an unattended `cswap auto` session could sit
-# pinned to a maxed account until its next reset. 99 (not 100) leaves a tick
-# of margin before a hard block.
-ESCAPE_UTILIZATION_PCT = 99.0
+# Anti-flap margin for the every-account-above-threshold escape, measured on
+# the axis that escape ranks by: a target must come back at least this much
+# sooner than the account we are leaving. Five minutes is comfortably longer
+# than one poll cycle, so two accounts whose windows roll over close together
+# cannot trade places on measurement jitter — the reverse move never clears
+# the margin. The percentage-point hysteresis is unmeetable in this state by
+# construction (everything is within a few points of its limit), which is why
+# it needs its own unit rather than a reused one.
+RECOVERY_HYSTERESIS_S = 300.0
+
+# Horizon past which a sooner reset stops being worth real headroom. The escape
+# above was measured on minutes-scale resets; days-scale is the opposite trade,
+# since neither account returns within the session. 4h keeps most of a 5-hour
+# cycle on the recovery ranking: a 5h window can be up to 5h from resetting, so
+# a peer bound by one that is 4h-5h out falls back to headroom ranking instead.
+# Deliberately the conservative side of that boundary -- ranking by headroom
+# where the reset is still an hour away costs at most one extra move, while a
+# wider horizon would rank by a reset the session may never see.
+RECOVERY_HORIZON_S = 4 * 3600.0
+
+# Anti-flap margin on the headroom axis, as a RATIO rather than percentage
+# points: strictly-more is no margin at all — one point moves the engine, the
+# target burns it back, and it ping-pongs. A ratio makes the move one-way.
+HORIZON_HEADROOM_RATIO = 2.0
+
+# The two anti-flap thresholds are both anchored to `active_headroom`, which
+# leaves a band where a peer is VISIBLE (the spent clause goes false, so the
+# reset axis switches off) yet UNCHOOSABLE (it misses the margin). Measured,
+# active 3.00 pts took a 0.10-pt peer over a 5.99-pt one, discarding 60x the
+# runway; and inside the band monotonicity inverts, so adding headroom flips a
+# move into a refusal.
+#
+# No single constant removes both ends — the two band widths sum to
+# `active x HORIZON_HEADROOM_RATIO - SPENT_HEADROOM_PCT`, so shrinking one
+# grows the other. Measured, not argued. The fix is in the ranking instead:
+# `best_candidate_headroom` carries no floor, and margin failures are
+# re-admitted through a one-way fallback used only when nothing else
+# qualifies.
+
+# Below this an account is spent, and headroom comparisons between two spent
+# accounts compare noise (a point is under ten minutes of work, less than two
+# poll intervals). When EVERY candidate is down here, rank by reset instead —
+# sit where quota returns first, however far out — rather than parking on
+# whichever account we happen to hold.
+SPENT_HEADROOM_PCT = 3.0
+
+
+def _recovery_is_useful(
+    candidate_recovery_ts: float,
+    active_recovery_ts: float,
+    active_headroom: float,
+    best_candidate_headroom: float,
+    now: float,
+) -> bool:
+    """Rank THIS candidate by soonest reset, rather than by headroom?
+
+    Two clauses, one place. Deciding it from four scattered gates left
+    reachable holes in four of the sixteen combinations.
+
+    Reset wins when everything worth having is spent — below
+    ``SPENT_HEADROOM_PCT`` a headroom edge is under two poll intervals, so the
+    only real question is which account returns first. Asked of the active and
+    the BEST candidate, not of every account: an unknown headroom is not
+    evidence of an empty one, and requiring all of them let a single sentinel
+    row veto the check for everybody.
+
+    It also wins when THIS candidate is back soon. Asked per candidate, not
+    once on the active: an active bound by its weekly window sits days out
+    while a peer's five-hour window returns in minutes.
+
+    Past the horizon we rank by headroom, and when no candidate meets the ratio
+    nobody qualifies — an active holding more quota than any peer can offer
+    should keep the work.
+
+    THE AXIS IS A PROPERTY OF THE PAIR, not of the candidate alone, and that
+    is what stops the two guards leaking into each other. Each anti-flap gate
+    is one-way on its OWN axis — hysteresis on recovery, a ratio on headroom —
+    but a switch swaps which account is "active". Keying the choice on the
+    candidate alone flipped the axis with it, so a pair straddling the horizon
+    took one gate going out and the OTHER coming back, and neither guard ever
+    saw both legs:
+
+        acct 1   8 points, reset 109h out      acct 2   3 points, reset 3.5h out
+        active=1 -> candidate inside  -> recovery: 3.5h < 109h      moves
+        active=2 -> candidate outside -> headroom: 8 >= 3*2         moves back
+
+    Measured: 47 credential rewrites over 3.9h on frozen inputs, ending only
+    when the sooner reset landed. ``either side inside`` is symmetric under
+    that swap, so the axis survives the move and the gate that permitted the
+    outbound leg is the one asked about the return — where hysteresis refuses
+    it, because the account we just left is now the distant one.
+
+    Why EITHER and not BOTH: requiring both would refuse the #202 case this
+    horizon exists to preserve — a weekly-bound active sitting days out while
+    a peer's five-hour window returns in eight minutes. Measured across
+    multiple ticks, both rules were checked against both shapes:
+
+        rule    oscillating pair        #202 pair
+        cand    moves, moves back       moves, moves back   (the bug)
+        both    never moves             never moves         (breaks #202)
+        either  moves, then holds       moves, then holds   (wanted)
+
+    The #202 case oscillated on the original code too — its test ticks once,
+    so it only ever observed the outbound leg.
+
+    The step between the two axes is NOT monotone, and an earlier version of
+    this docstring claimed it was ("0 inversions"). Re-swept directly over the
+    predicate — active 1..12 pts against a peer walked 0.5..40 at 0.05, four
+    reset shapes — a strictly-better peer does flip a move into a refusal, and
+    every case sits on one point: `peer_h` crossing SPENT_HEADROOM_PCT, where
+    the spent clause goes false and the axis changes underneath the comparison.
+
+    That is the axis boundary, not a leak, and it is NOT reachable through
+    `tick()`: the fallback at the bottom of the ranking loop re-admits exactly
+    those candidates. A reviewer re-took the same sweep and got a different
+    count from mine, which is the point — the count depends on the sweep's step
+    and reset shapes, so it is stated as WHERE rather than HOW MANY.
+    """
+    if (
+        active_headroom <= SPENT_HEADROOM_PCT
+        and best_candidate_headroom <= SPENT_HEADROOM_PCT
+    ):
+        # The axis CAN change as the fleet burns, and that is not a leak:
+        #
+        #     out    active 2.0 / peer 4.0   headroom axis, 4.0 >= 2.0x2
+        #     back   active 3.0 / peer 2.0   recovery  axis, 10h vs 80h
+        #
+        # Each leg is legitimate on the axis its own state selects, and the
+        # transition is in the DATA rather than in the gates: constraining
+        # either gate does not remove it.
+        return True
+    return (
+        candidate_recovery_ts - now <= RECOVERY_HORIZON_S
+        or active_recovery_ts - now <= RECOVERY_HORIZON_S
+    )
+
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
@@ -546,6 +698,63 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     return None
 
 
+def _binding_recovery_ts(
+    usage: dict | str | None, models: Sequence[str], now: float
+) -> float:
+    """When this account's *binding* window comes back, as a sort key.
+
+    The binding window is the one holding the account back — the highest
+    utilization among the windows that gate it (the same set
+    ``account_headroom`` measures, so ranking and headroom can never disagree
+    about which window matters). Its reset is the moment the account becomes
+    useful again.
+
+    Not the weekly window: with every account in the 90s the thing that
+    decides where to go is which 5-hour window rolls over first, and that is
+    routinely minutes away while the weekly one is days away.
+
+    Returns ``inf`` when unknown or already past, so such accounts sort last
+    rather than masquerading as "back immediately" — a stale ``resets_at``
+    would otherwise rank a snapshot nobody has refreshed above a measured,
+    genuinely imminent one.
+    """
+    # Pick the BINDING window first, then ask for its reset. Filtering on the
+    # reset before the max lets a lower window win whenever the binding one's
+    # reset is unknown or past — measured: 7d at 95% with no resets_at and 5h
+    # at 40% resetting in an hour returned "back in an hour", which is the
+    # opposite of what binds. An account whose binding window has no usable
+    # reset is one we cannot schedule around, and inf sorts it last.
+    windows = list(oauth.relevant_windows(usage, models))
+    if not windows:
+        return float("inf")
+    _label, _pct, resets_at = max(windows, key=lambda w: w[1])
+    ts = _parse_reset_ts(resets_at)
+    return ts if ts is not None and ts > now else float("inf")
+
+
+def _every_account_above_threshold(
+    candidates: Sequence[str],
+    headroom: dict[str, float | None],
+    active_headroom: float | None,
+    threshold: float,
+) -> bool:
+    """Whether the active account AND every measured candidate are at or over
+    the threshold — the state where "land somewhere healthy" has no answer.
+
+    Requires the active account's own headroom to be known: without it we do
+    not know we are in this state, and guessing here would relax the landing
+    rule on an ordinary tick. An unmeasured candidate does not block the
+    verdict (it may be healthy, but it cannot be *chosen* either — the caller
+    skips ``None`` headroom) as long as at least one candidate was measured.
+    """
+    if active_headroom is None or (100.0 - active_headroom) < threshold:
+        return False
+    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    if not measured:
+        return False
+    return all((100.0 - h) >= threshold for h in measured)
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
@@ -779,14 +988,17 @@ class AutoSwitchEngine:
         )
         if not near_expiry:
             return "ok"
-        outcome = oauth.try_refresh_oauth_credentials(creds)
+        # The consume gate serializes every backup-rt POST (the recovery
+        # branch in `_fetch_active_usage` is a second call site, under the
+        # same per-slot consume lock):
+        # it re-reads under the slot lock (our snapshot may be superseded),
+        # consults the session profile for a newer generation, and persists
+        # via fingerprint CAS — so a freshen racing the collector (or a
+        # sibling surface) can no longer double-consume one grant.
+        outcome = self.switcher.consume_backup_grant(number, email, creds)
         if outcome.error is None and outcome.credentials:
-            # Persist first, unconditionally: the grant consumed a generation,
-            # and not writing the successor would kill the lineage regardless
-            # of whose it turns out to be.
-            self.switcher.persist_backup_credentials(
-                number, email, outcome.credentials
-            )
+            # The gate already persisted the successor (or adopted a racing
+            # writer's newer lineage) under its own lock.
             if self._note_token_identity(number, outcome.token_account):
                 # The slot's stored credential authenticates as a *different*
                 # account — activating it would put the user on the wrong
@@ -797,6 +1009,15 @@ class AutoSwitchEngine:
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
             return "invalid_grant"
+        if outcome.error in _SYSTEMIC_STATUSES:
+            # Deterministic conditions, not network trouble: every candidate
+            # refuses identically and keeps refusing until something outside
+            # this process changes — the shell for store-unmirrored (an
+            # inherited CLAUDE_SECURESTORAGE_CONFIG_DIR), our OAuth client
+            # registration for invalid_client. Reported distinctly so the tick
+            # error names the real cause instead of "(network?)", which would
+            # send the user to check a connection that is fine.
+            return outcome.error
         return "transient"
 
     def _note_token_identity(
@@ -1119,6 +1340,10 @@ class AutoSwitchEngine:
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
+        # The no-return bar itself lives in `_rank` below: it is a statement
+        # about the CHOICE, so it belongs where the choice is made rather than
+        # in this census of what exists. See `_no_return_account` for the
+        # incident, the scoping, and the release.
         api_key_candidates = (
             [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
             if settings.include_api_key_accounts
@@ -1155,7 +1380,82 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
-        ordered, any_known, active_reset_ts = self._rank_candidates(
+
+        def _rank(**kw):
+            """Rank with the no-return bar, and WITHOUT it if that empties AND
+            the barred account is a different proposition from the one we left.
+
+            Emptiness alone cannot be the release. On two accounts there is
+            exactly one candidate, so barring it ALWAYS empties the list —
+            measured, sweeping active x barred headroom x both reset shapes,
+            `n=2 barred-rank EMPTY=320 NONEMPTY=0`. An emptiness-only release
+            therefore fires every tick and the bar is inert at the fleet size
+            the flap was reported on: pcts 92/92, resets 500h/400h, 60 ticks
+            gave `[1, 2, 1, 2]` with the bar on and the identical `[1, 2, 1, 2]`
+            with `lastSwitchFrom` popped every tick.
+
+            "BARRING LEAVES NOTHING" AND "WE ARE FLAPPING" ARE DIFFERENT
+            STATES, and at n=2 they are always the same state — which is how
+            one swallowed the other. The ranking cannot separate them: it sees
+            only the present, and both look like an empty list. What separates
+            them is WHY the ranking flipped. Traced at each leg of that walk:
+
+                t8   1->2   left 1 holding 4.0 pts, 500h out
+                t20  2->1   account 1 still 4.0 pts, still 500h out
+                t22  1->2   account 2 still 2.0 pts, still 400h out
+
+            Every return won because the ACTIVE burned down, never because the
+            target recovered. So the release asks the one question the ranking
+            cannot: is the account we left better than when we left it?
+
+            ON BOTH AXES THE RANKING USES, and with the margins it already
+            uses — ``SPENT_HEADROOM_PCT`` of headroom (below that an edge is
+            under two poll intervals of work) or ``RECOVERY_HYSTERESIS_S``
+            sooner. An account's headroom rises only when a window rolls over
+            and its binding reset only moves nearer when a nearer window
+            starts binding, so both are real events rather than the boundary
+            crossings burn manufactures for free.
+
+            Emptiness still decides whether to ASK. Where the bar leaves a
+            real alternative it simply applies, so a fleet with somewhere else
+            to go is untouched by any of this.
+
+            Cheap: the retry runs only when the barred list came back empty,
+            which is the tick that was about to do nothing anyway.
+            """
+            # Recomputed per snapshot, never once per tick: the consume-first
+            # two-phase commit replaces `headroom` and `active_headroom` and
+            # re-ranks, and the ratio release consumes exactly those two
+            # values. Computed once, the bar answered from a snapshot the
+            # ranking had already thrown away — `left=20 active=30` bars,
+            # `left=90 active=10` releases, and phase 2 is where that flips.
+            recovered = self._left_account_recovered(
+                state,
+                kw["usage"],
+                kw["headroom"],
+                kw["active_headroom"],
+                kw["settings"],
+                kw["now"],
+                kw["current"],
+            )
+            no_return = self._no_return_account(
+                trigger,
+                state,
+                kw["headroom"],
+                kw["active_headroom"],
+                recovered,
+                kw["settings"],
+                kw["current"],
+            )
+            ranked = self._rank_candidates(no_return=no_return, **kw)
+            if no_return is not None and not ranked[0] and recovered:
+                unbarred = self._rank_candidates(no_return=None, **kw)
+                if unbarred[0]:
+                    return unbarred
+            return ranked
+
+        decided_now = self.clock()
+        ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,
             oauth_candidates=oauth_candidates,
@@ -1164,7 +1464,7 @@ class AutoSwitchEngine:
             current=current,
             active_headroom=active_headroom,
             settings=settings,
-            now=self.clock(),
+            now=decided_now,
         )
 
         if trigger == "consume-first" and ordered:
@@ -1185,7 +1485,8 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
-            ordered, any_known, active_reset_ts = self._rank_candidates(
+            decided_now = self.clock()
+            ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
                 oauth_candidates=oauth_candidates,
@@ -1194,38 +1495,8 @@ class AutoSwitchEngine:
                 current=current,
                 active_headroom=active_headroom,
                 settings=settings,
-                now=self.clock(),
+                now=decided_now,
             )
-
-        if (
-            not ordered
-            and trigger == "proactive"
-            and active_headroom is not None
-            and (100.0 - active_headroom) >= ESCAPE_UTILIZATION_PCT
-        ):
-            # Wedge-breaker: a proactive tick where the active account is
-            # critically high (>= the escape line, but short of the 100% that
-            # would already classify at-limit) yet no candidate cleared the
-            # normal landing gate. Holding to the next reset would strand an
-            # unattended session, so fall back to an at-limit rank (landing
-            # gate skipped) and take the best live account — least-bad beats
-            # wedged. Deliberately not for the consume-first trigger: that path
-            # never re-classifies mid-tick (a 100% active escapes on the next
-            # tick's normal at-limit classification).
-            escaped, any_known, active_reset_ts = self._rank_candidates(
-                trigger="at-limit",
-                consume_first=consume_first,
-                oauth_candidates=oauth_candidates,
-                usage=usage,
-                headroom=headroom,
-                current=current,
-                active_headroom=active_headroom,
-                settings=settings,
-                now=self.clock(),
-            )
-            if escaped:
-                ordered = escaped
-                trigger = "at-limit"
 
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
@@ -1312,7 +1583,15 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         # -- freshen + switch ----------------------------------------------
+        # The departure snapshot of the account we are leaving, taken from the
+        # SAME `usage`/`headroom` the ranking just decided on — for
+        # consume-first that is the phase-2 refetch, not the stale one.
+        left_snapshot = (
+            active_headroom,
+            _binding_recovery_ts(usage.get(current), self._models, decided_now),
+        )
         transient_failure = False
+        systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
             if trigger == "consume-first":
@@ -1337,7 +1616,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger)
+                return self._perform(num, email, trigger, left_snapshot)
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1352,14 +1631,30 @@ class AutoSwitchEngine:
             if status == "transient":
                 transient_failure = True
                 continue
+            if status in _SYSTEMIC_STATUSES:
+                # ONE cause is reported, so it must be the one worth acting
+                # on. Assigning unconditionally made it the LAST candidate's,
+                # and `consume-busy` clears itself on the next pass while the
+                # other two need a human — unset an env var, chase a rejected
+                # client_id. So a busy slot sorting after an unmirrored one
+                # named the harmless cause and hid the real one: exactly the
+                # "reads as intermittent, nothing names it" trap these kinds
+                # were split out of "transient" to escape.
+                if not systemic or _SYSTEMIC_STATUSES.index(
+                    status
+                ) < _SYSTEMIC_STATUSES.index(systemic):
+                    systemic = status
+                continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger)
+            return self._perform(num, email, trigger, left_snapshot)
 
-        if transient_failure:
+        if systemic or transient_failure:
             self._emit(
                 ErrorEvent(
-                    message="could not freshen any candidate (network?)",
+                    message="could not freshen: " + _SYSTEMIC_MESSAGES[systemic]
+                    if systemic
+                    else "could not freshen any candidate (network?)",
                     transient=True,
                 )
             )
@@ -2117,7 +2412,20 @@ class AutoSwitchEngine:
         primed_slots: list[str],
     ) -> TickOutcome:
         if self.dry_run:
-            return self._perform(target, self.switcher.account_email(target), "paced")
+            # Departure snapshot of the account we are leaving, for the
+            # no-return bar `_perform` records. Taken from the same snapshot
+            # usage the paced controller decided on.
+            left_usage = snapshot_usage.get(expected_current)
+            left_snapshot = (
+                oauth.account_headroom(
+                    left_usage if isinstance(left_usage, dict) else None,
+                    self._models,
+                ),
+                _binding_recovery_ts(left_usage, self._models, self.clock()),
+            )
+            return self._perform(
+                target, self.switcher.account_email(target), "paced", left_snapshot
+            )
 
         committed_failover = failover
         with self._state_lock():
@@ -2252,6 +2560,376 @@ class AutoSwitchEngine:
             )
         )
         return TickOutcome.SWITCHED
+    def _no_return_account(
+        self,
+        trigger: str,
+        state: dict,
+        headroom: dict[str, float | None],
+        active_headroom: float | None,
+        recovered: bool,
+        settings: AutoSwitchSettings,
+        current: str | None = None,
+    ) -> str | None:
+        """The account this engine most recently left, while it is still barred.
+
+        NEVER UNDO THE PREVIOUS MOVE. Each anti-flap gate is one-way on its own
+        axis, but the axis is a property of the pair's STATE and burn changes
+        that state: the ratio gate is relative (`h >= active x 2`) and the
+        spent gate absolute (`active <= 3.0`), so a burning pair crosses the
+        boundary repeatedly and each crossing re-opens a move. Measured, both
+        resets past the horizon, only the active burning: `[1, 2, 1, 2]` where
+        base makes one move.
+
+        SCOPED like every sibling gate — `at-limit` and `failover` skip the
+        anti-flap gates by design. Unscoped this stranded a 2-account fleet on
+        an exhausted active with the peer at 0%.
+
+        AND SCOPED TO THE ENGINE'S OWN LANDING (`lastSwitchTo == current`).
+        The bar refuses to undo THIS ENGINE'S last move; once the user
+        switches by hand the engine is no longer sitting where it put itself
+        and that move is already undone, so the bar protects nothing and
+        merely withholds the fleet's best account. Reproduced: engine 1 -> 2,
+        user 2 -> 3 by hand, account 1 on 4 pts still barred against an
+        active on 2, every reset far out, no release leg reachable — the
+        `not recovered` return below fires before the ratio leg is read, and
+        `recovered` is False because account 1 was 4 pts at departure too.
+        The engine then holds the worse account until the at-limit escape.
+        Both sides are `str`-normalised: `lastSwitchTo` is a `str` from
+        `_perform` and `lastSwitchFrom` an `int` from `account_ref`. A state
+        record written before `lastSwitchTo` existed has no such key and
+        cannot prove the engine moved away, so it KEEPS the bar — the same
+        conservative reading this module gives every other missing field, and
+        the only one that does not silently drop the anti-flap bound for an
+        upgrade cycle.
+
+        RELEASED when the account we left now beats us by the same ratio the
+        anti-flap margin uses: that is not the flip this bars, it is a move the
+        outbound leg would have made on its own merits — BUT ONLY IF IT HAS
+        ACTUALLY RECOVERED. The ratio compares against the ACTIVE, and the
+        active burns, so ungated it comes true on a target that has done
+        nothing. Measured on the cited walk, the barred account held 4.0 pts at
+        departure and 4.0 pts at every return; the ratio fired purely because
+        the active fell to 2.0, which is the flap arriving through the release
+        instead of through the ranking. `recovered` is that gate, computed once
+        per snapshot by `_left_account_recovered` and shared with the
+        leaves-nothing retry in `_rank` so the two cannot disagree.
+
+        THE LEAVES-NOTHING RELEASE IS NOT HERE. It used to be, and it was
+        rewritten twice for the same reason both times: this function cannot
+        see the gates that decide. `lastSwitchFrom` is rewritten only by a
+        successful switch — the one thing the bar prevents — so a bar that
+        empties the ranking is permanent, and each attempt to predict emptiness
+        landed one gate short of the ranking loop:
+
+            all(n == barred ...)              "does another account EXIST"
+            (headroom.get(n) or 0.0) > 0.0    "is another account not at its limit"
+
+        The loop also applies the threshold, `h >= active x HORIZON_HEADROOM_
+        RATIO`, the spent fallback's `h >= active` plus a sooner reset, and the
+        recovery hysteresis. A third account on ONE point clears both
+        predicates above and none of those, so the n=2 stall came back at n>=3
+        and then again one point up. Measured: barred peer 3.5 pts / back in
+        10h, active 2 pts / 500h out, third 1 pt — 30 ticks all BLOCKED, and
+        the same fleet with `lastSwitchFrom` popped switches on the first.
+
+        `_rank` now ASKS the ranking instead: it ranks with the bar, and
+        re-ranks without it when the result is empty. That is exact by
+        construction, covers the recovery axis this predicate never could, and
+        cannot be one gate behind because it is not a separate copy of the
+        gates.
+
+        EMPTINESS ALONE IS NOT THE RELEASE, though — see `_rank`. At n=2 the
+        barred ranking is always empty, so an emptiness-only retry is a no-op
+        at exactly the fleet size the flap was reported on. Both the retry and
+        the ratio above are gated on `recovered`, which is the one question the
+        ranking cannot answer: is this a different account from the one we
+        left, or only a different active?
+        """
+        came_from = state.get("lastSwitchFrom")
+        if trigger not in ("proactive", "consume-first") or came_from is None:
+            return None
+        # Only while we are still standing where that switch put us. A manual
+        # switch away already undid the move, so there is nothing left to
+        # refuse to undo. `str` on both sides: `lastSwitchTo` is written from
+        # `_perform`'s `number: str`, `lastSwitchFrom` from `account_ref`'s
+        # `number: int`, and an int/str mismatch here would disarm the bar
+        # everywhere rather than only after a hand switch.
+        landed_on = state.get("lastSwitchTo")
+        if landed_on is not None and current is not None:
+            if str(landed_on) != str(current):
+                return None
+        # No membership check on `oauth_candidates`: the loop compares
+        # `num == no_return` while iterating that same list, so naming an
+        # account that is not in it bars nothing. The check was a no-op and
+        # nothing killed it under mutation.
+        barred = str(came_from)
+        if not recovered:
+            return barred        # the ratio below burns true on its own; see above
+        left_headroom = headroom.get(barred)
+        if left_headroom is not None:
+            if active_headroom is not None:
+                if left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO:
+                    return None               # beats us outright; not a flip
+            elif (
+                settings is not None
+                and left_headroom > 100.0 - settings.threshold
+            ):
+                # An unreadable active must not be silently scored as "the
+                # peer does not beat it" -- same landing-eligible fallback
+                # `_left_account_recovered` uses when it, too, has no active
+                # to compare against.
+                return None
+        return barred
+
+    def _left_account_recovered(
+        self,
+        state: dict,
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        active_headroom: float | None,
+        settings: AutoSwitchSettings,
+        now: float,
+        current: str | None = None,
+    ) -> bool:
+        """Is the account we left a better proposition than when we left it?
+
+        This is the release the bar needs and the ranking cannot supply. A bar
+        that leaves nothing is a stall, but "leaves nothing" is also what every
+        flap looks like on two accounts, so lifting on emptiness alone lifts
+        always. The distinction is not in the present state — it is between the
+        present and the moment of departure, which is why `_perform` records
+        that moment (`leftHeadroom` / `leftRecoveryAt`) alongside
+        `lastSwitchFrom`.
+
+        Measured on the walk this guard exists for, the barred account was
+        IDENTICAL at every return — same headroom, same reset — and only the
+        active had changed. That is the flap: the ranking flipped underneath a
+        target that did nothing.
+
+        FAILOVER FIRST, before any leg reads the active — checked ahead of
+        dominance, because dominance-first starves this branch:
+        `test_a_failover_departure_does_not_disarm_the_bar` broke on its
+        FIRST tick the instant the active fell far enough for `4.0 > active
+        x 2` to go true (measured at active=1.8, one fifth of a point past
+        the boundary this branch's own sibling test already sits on).
+        A `(None, None)` snapshot means severity was genuinely unmeasured at
+        departure — there is no `leftHeadroom` to diff against and never was
+        — so the two signals that do not depend on the active's LIVE state
+        are (1) whether the peer, right now, would itself be a healthy place
+        to land: `h > 100 - settings.threshold`, the same "would the ranking
+        accept this as a landing spot" test `_rank_candidates` already runs
+        (`:1617`) on every candidate, reused rather than inventing a fresh
+        constant; and (2), when the landing floor cannot answer, whether the
+        peer's own binding reset is meaningfully sooner than the active's.
+        The landing floor is the exact complement of
+        `_every_account_above_threshold`, so it is UNSATISFIABLE whenever
+        the
+        fleet is all-spent — the recovery leg is what keeps the hold from
+        becoming unconditional in exactly that regime. Neither leg can tell
+        "genuinely recovered" from "was already this good" — there is
+        nothing recorded to tell them apart. Measured which side the landing
+        floor should land on: sweeping mutations of this same leg for the
+        ordinary path showed an absolute floor is silently reintroducible
+        with a green suite, so this is not free of that risk either — the
+        difference is this constant is `settings.threshold`, not a
+        hardcoded number, so a
+        user's OWN policy decides how conservative the hold is, and it moves
+        when they change it (pinned directly, below). Deliberately MORE
+        conservative than the ordinary path below: a peer sitting at 4 points
+        held through the whole walk that broke a bare dominance leg, with no
+        upper bound short of the peer crossing the threshold itself OR its
+        binding reset pulling meaningfully ahead of the active's. Bounded,
+        not permanent — at-limit still escapes untouched
+        (`_no_return_account` scopes this trigger out entirely), and the
+        recovery leg means the bound is no longer just "the active reaches
+        its own hard limit": a peer that resets first releases the hold on
+        its own schedule, without the active ever needing to burn down to it.
+
+        THE ORDINARY PATH HAS A REAL BASELINE (`leftHeadroom` is a number,
+        not null), so it gets three legs, checked in this order, each with
+        the margin its axis already uses. Burn cannot manufacture any of
+        them: headroom rises only when a window rolls over, the ratio needs
+        the active to lose more than half its remaining headroom AND clear
+        an extra `SPENT_HEADROOM_PCT` on top, and the binding reset moves
+        nearer only when a nearer window starts binding.
+
+          dominance   `> active x HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT`
+                      against the ACTIVE. A peer moved AWAY from for a reason
+                      other than headroom (e.g. consume-first's reset
+                      ordering) can dominate the active from the moment it
+                      was left, and self-improvement against its own
+                      departure baseline never fires for an account that had
+                      nothing to improve on. The `+SPENT_HEADROOM_PCT` on top
+                      of the bare ratio is what the bare ratio misses:
+                      measured on this branch's own flap fleet (peer frozen
+                      4.0 pts, active burning 98.0% -> 98.4%), it flips
+                      true at active=1.8 pts purely because the active kept
+                      burning; the same walk with the margin added stays
+                      false through active=1.6 and only opens once the active
+                      is down to a genuine sliver (`x < 0.5`), which is the
+                      at-limit escape's territory, not a return worth calling
+                      anti-flap. `test_a_burn_walk_never_returns_to_what_it_
+                      left` still settles with the margin in place — it makes
+                      the boundary harder to cross, not impossible.
+          headroom    `+SPENT_HEADROOM_PCT` against the DEPARTURE baseline
+                      — below that an edge is under two poll intervals, the
+                      same reason the spent band exists.
+          recovery    `-RECOVERY_HYSTERESIS_S` against the DEPARTURE
+                      baseline — the same margin the recovery axis ranks by
+                      one gate later.
+
+        NO SNAPSHOT MEANS RELEASE. State written before this field existed, or
+        by a switch that never recorded one, carries no evidence either way —
+        and of the two failure modes the permanent proactive lockout is the
+        worse one, because it is persisted and survives a restart and a week of
+        wall clock. Absence of evidence releases. This only gates the
+        proactive/consume-first return; `_no_return_account` scopes at-limit
+        and failover out of the bar by design, so either trigger still
+        escapes the account untouched, and the next successful switch
+        overwrites the snapshot outright.
+        """
+        came_from = state.get("lastSwitchFrom")
+        if came_from is None:
+            # Unreachable through `_no_return_account`, the only caller: it
+            # returns `None` at its own `came_from is None` check before
+            # `recovered` is ever read. Kept `True` (not load-bearing) so a
+            # future direct caller gets "no evidence, release" rather than a
+            # silent hold.
+            return True
+        barred = str(came_from)
+        if "leftHeadroom" not in state:
+            return True          # pre-upgrade record: genuinely no evidence
+        h = headroom.get(barred)
+        left_headroom = state.get("leftHeadroom")
+        left_recovery = state.get("leftRecoveryAt")
+        # A `consume-first` departure can ALSO write (None, None) -- the
+        # same shape a real failover writes -- whenever the phase-2 refetch's
+        # active row is unmeasurable for headroom but still has a known
+        # weekly reset (the split shape `oauth.
+        # build_usage_result` emits for `utilization: null` plus a
+        # `resets_at`). Inferring "failover" from the two nulls then ran the
+        # more permissive failover legs (landing floor + recovery-only) on
+        # what was really an ordinary departure -- reachable on 32%+ of
+        # swept fleets, both directions. `leftTrigger` records the actual
+        # trigger so this never has to guess again; a record written before
+        # this field existed has no such key, so fall back to the old
+        # two-null inference for it (unchanged behaviour for pre-upgrade
+        # state).
+        left_trigger = state.get("leftTrigger")
+        is_failover_snapshot = (
+            left_trigger == "failover"
+            if left_trigger is not None
+            else (left_headroom is None and left_recovery is None)
+        )
+        if is_failover_snapshot:
+            # Failover: real departure, severity unmeasured at the time --
+            # not absence of evidence, and there is no baseline to diff
+            # against (that is exactly what "unmeasured" means), so this
+            # cannot use the active's HEADROOM at all -- see docstring for
+            # why reading the active's headroom here is wrong, and the walk
+            # that proved it. Two legs, both read-only against CURRENT state
+            # (no departure baseline exists to diff against):
+            #
+            #   landing   `h > 100 - settings.threshold` -- would the
+            #             ranking accept this peer as a landing spot right
+            #             now (`_rank_candidates`, :1636)?
+            #   recovery  the peer's binding reset is meaningfully sooner
+            #             than the ACTIVE's binding reset -- the same axis
+            #             `_recovery_is_useful` switches to once headroom
+            #             stops being informative. Needed because `landing`
+            #             is the exact complement of `_every_account_above_
+            #             threshold`: whenever the fleet is all-spent,
+            #             `landing` is unsatisfiable by construction, no
+            #             matter how soon the peer's own
+            #             window resets, and that regime is precisely where
+            #             the recovery axis is the one the engine trusts.
+            #
+            # Burn cannot fake the recovery leg: a reset moves nearer only
+            # when a nearer window starts binding, never as a side effect
+            # of the active spending down -- the failure mode a bare
+            # dominance leg has, guarded directly in the mutation table.
+            if h is not None and h > 100.0 - settings.threshold:
+                return True
+            peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
+            active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
+            # The active's recovery must be a REAL measurement, not merely
+            # "larger" -- `_binding_recovery_ts` returns `inf` for both
+            # "never resets" and "we do not know" (no windows, no
+            # `resets_at`, or a stale/past `resets_at`). Reading `inf` as
+            # "never" here made `peer < inf - HYST` true for ANY finite
+            # peer reset, releasing onto a peer arbitrarily far out on no
+            # evidence. `math.isfinite` requires the active to have a
+            # genuine, known reset before the comparison even runs --
+            # unknown holds, exactly like unreadable already does on the
+            # headroom axis.
+            #
+            # But two of the five `inf` states are ordinary shapes for an
+            # active that is plainly alive and burning -- a `pct` reported
+            # with no `resets_at`, or a `resets_at` already elapsed -- not
+            # unknowns. Reading all five as "unknown, hold" pins the engine
+            # on a near-spent active for up to a full window even when the
+            # peer is back within `RECOVERY_HORIZON_S`, the
+            # same constant this PR already uses for "near enough to
+            # matter" (`_recovery_is_useful`). Requiring EITHER a known
+            # active reset OR a peer inside that horizon keeps `isfinite`'s
+            # intended release (a known active vs. an arbitrarily-far peer
+            # still needs `isfinite`) while letting a near peer through
+            # regardless of why the active's own reset reads `inf`.
+            return (
+                (
+                    math.isfinite(active_recovery_ts)
+                    or peer_recovery_ts - now <= RECOVERY_HORIZON_S
+                )
+                and peer_recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
+            )
+        # Dominance over the ACTIVE, only reached once a real baseline is
+        # confirmed to exist above -- a peer that was already miles ahead of
+        # the active at departure (moved for a DIFFERENT reason -- e.g.
+        # consume-first's reset ordering, not headroom) never "improves" on
+        # its own baseline and would stall on self-improvement alone despite
+        # dominating throughout.
+        #
+        # `active_headroom is None` means "we could not read the active this
+        # tick" -- reachable through the consume-first two-phase commit,
+        # which reassigns `active_headroom` from a fresh
+        # refetch without re-classifying the trigger. That is a DIFFERENT
+        # state from "readable, but does not dominate" and must not answer
+        # the same way: fall back to the landing-eligible test the failover
+        # branch above uses when IT has no baseline to compare against
+        # either, rather than silently treating "unreadable" as "no
+        # dominance".
+        #
+        # DEFENSIVE, not currently outcome-changing: measured exhaustively,
+        # `active_headroom=None` on this path closes
+        # BOTH of `_rank_candidates`'s gates before this leg is ever asked
+        # (`_every_account_above_threshold` is False on a None active, and
+        # the consume-first `active_reset_ts` gate is None too), so no
+        # fleet shape has been found where this branch changes a `tick()`
+        # outcome. Kept because the call IS reachable (confirmed via the
+        # phase-2 refetch) and a future change to those gates could make it
+        # live without anyone revisiting this function -- silently reading
+        # None as "no dominance" would then be exactly the bug the
+        # unreadable-active fallback was added for.
+        if h is not None:
+            if active_headroom is not None:
+                if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
+                    return True
+            elif h > 100.0 - settings.threshold:
+                return True
+        if (
+            isinstance(left_headroom, (int, float))
+            and h is not None
+            and h >= min(left_headroom + SPENT_HEADROOM_PCT, 100.0)
+        ):
+            return True
+        # `None` is the JSON-safe spelling of "unknown or already past", which
+        # `_binding_recovery_ts` returns as `inf`: an account nobody can
+        # schedule around. Moving off it onto a real reset IS the improvement.
+        was = left_recovery if isinstance(left_recovery, (int, float)) else float("inf")
+        return (
+            _binding_recovery_ts(usage.get(barred), self._models, now)
+            < was - RECOVERY_HYSTERESIS_S
+        )
 
     def _rank_candidates(
         self,
@@ -2259,6 +2937,7 @@ class AutoSwitchEngine:
         trigger: str,
         consume_first: bool,
         oauth_candidates: list[str],
+        no_return: str | None,
         usage: dict[str, dict | str | None],
         headroom: dict[str, float | None],
         current: str,
@@ -2278,15 +2957,63 @@ class AutoSwitchEngine:
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
+        # When NOTHING is below the threshold — the active account and every
+        # candidate all in the 90s — "land somewhere healthy" has no answer,
+        # and holding out for one costs the user the session. Sitting still
+        # means burning the active account to 100% and taking a hard limit,
+        # with the peer that resets in 8 minutes never tried. So in that state
+        # the goal changes from "most headroom" to "soonest back": move to
+        # whichever account recovers first and keep working through its reset.
+        #
+        # Deliberately narrow. It engages only when every measured OAuth
+        # account is at/over the threshold, so a single healthy peer still
+        # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
+        # percentage-point margin so two accounts in the 90s cannot ping-pong.
+        all_above = _every_account_above_threshold(
+            oauth_candidates, headroom, active_headroom, settings.threshold
+        )
+        # "Is anything worth having?" — the most headroom any candidate with a
+        # READABLE row offers. Two exclusions and no others:
+        #
+        # Unknown headrooms are skipped rather than counted as zero. A row we
+        # cannot read is not evidence of an empty account — measured, one
+        # sentinel row (expired token, locked keychain) made `all(...)` False
+        # forever and parked the engine on the account resetting LAST.
+        #
+        # Nothing else is filtered, INCLUDING the no-return bar. An earlier
+        # version of this comment claimed it was "scoped to choosable
+        # candidates"; the code below has never done that and the two
+        # paragraphs contradicted each other. Leaving the barred account in is
+        # deliberate: this answers whether the FLEET has quota, and the bar is
+        # about which account to move to, not about what exists. A peer just
+        # above SPENT_HEADROOM_PCT can therefore turn the spent check off while
+        # being unchoosable itself — the band is (SPENT_HEADROOM_PCT, active x
+        # RATIO], up to 3 points wide at the defaults, and the one-way fallback
+        # below is what stops that band parking the engine. A ratio floor used
+        # to sit here too and inverted monotonicity; removing it is what let
+        # the fallback do the job.
+        best_candidate_headroom = max(
+            (h for h in map(headroom.get, oauth_candidates) if h is not None),
+            default=0.0,
+        )
+        active_recovery_ts = (
+            _binding_recovery_ts(usage.get(current), self._models, now)
+            if all_above
+            else 0.0  # unread unless all_above; never a live sentinel
+        )
+
         qualifying: list[tuple[tuple, str]] = []
+        fallback: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
                 continue
-            any_known = True
+            any_known = True          # it EXISTS and is readable either way
             if h <= 0:
                 continue  # itself at its limit — never a target
+            if num == no_return:
+                continue  # the account we just left; see _no_return_account
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
@@ -2298,6 +3025,11 @@ class AutoSwitchEngine:
                 if consume_first
                 else {}
             )
+            recovery_ts = (
+                _binding_recovery_ts(usage.get(num), self._models, now)
+                if all_above
+                else 0.0
+            )
             if trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account already over the trigger
                 # would re-fire on the very next tick. best keeps the binding
@@ -2307,13 +3039,69 @@ class AutoSwitchEngine:
                 # only deprioritizes it in the ranking below. At-limit and
                 # failover skip this block entirely (any live account beats a
                 # blocked or dead one).
+                #
+                # When `all_above` (nothing below the threshold), the landing
+                # gate is skipped entirely — the `and not all_above` guard on
+                # both branches lets the recovery ranking below take over, so
+                # the engine moves to whichever account resets soonest instead
+                # of holding out for a healthy landing that does not exist.
                 if consume_first:
                     five_h = cand_pcts.get("5h")
-                    if five_h is not None and five_h >= settings.eff_5h():
+                    if (
+                        five_h is not None
+                        and five_h >= settings.eff_5h()
+                        and not all_above
+                    ):
                         continue
-                elif (100.0 - h) >= settings.threshold:
+                elif (100.0 - h) >= settings.threshold and not all_above:
                     continue
-                if consume_first:
+                if all_above:
+                    # Checked before the strategies, because with nothing below
+                    # the threshold the strategy question is moot: consume-first
+                    # exists to spend perishable WEEKLY quota, and every account
+                    # here is blocked on a window that returns in minutes. Both
+                    # strategies want the same thing — the account that can work
+                    # again first — so both take this gate and the matching key
+                    # below. (Ordering matters: `if consume_first` catching
+                    # first filtered on weekly ordering while the key sorted on
+                    # binding recovery, two different axes, and left
+                    # consume-first users with no anti-flap guard at all.)
+                    #
+                    # WHICH AXIS is decided per candidate, in one place — see
+                    # _recovery_is_useful for the four holes that came from
+                    # deciding it once, globally, from four scattered gates.
+                    # Set and read under the same `all_above and trigger`
+                    # condition, so it is always assigned before the key below.
+                    by_recovery = _recovery_is_useful(
+                        recovery_ts,
+                        active_recovery_ts,
+                        active_headroom or 0.0,
+                        best_candidate_headroom,
+                        now,
+                    )
+                    if by_recovery:
+                        # Hysteresis on the axis we actually rank by. It bounds
+                        # the flap RATE rather than making a reverse move
+                        # impossible: the target must come back meaningfully
+                        # sooner than where we are.
+                        if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
+                            continue
+                    else:
+                        # Headroom axis, with a RATIO margin. Also a rate bound,
+                        # not impossibility — headroom moves, so a target that
+                        # burns down to a quarter of what it beat can qualify
+                        # in reverse. That takes a 4x relative burn instead of
+                        # the one point a strictly-greater test would need.
+                        if h < (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO:
+                            if (
+                                (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
+                                and h >= (active_headroom or 0.0)
+                                and recovery_ts
+                                < active_recovery_ts - RECOVERY_HYSTERESIS_S
+                            ):
+                                fallback.append(((0, recovery_ts, -h), num))
+                            continue
+                elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
                     # than the active one (above the threshold we must move, so
@@ -2330,7 +3118,32 @@ class AutoSwitchEngine:
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if consume_first:
+            if all_above and trigger in ("proactive", "consume-first"):
+                # Ranked on the axis its own gate decided, and TIERED so the two
+                # stay comparable: a candidate returning inside the horizon
+                # beats one that does not, whatever its headroom. Untiered, the
+                # two key shapes were compared elementwise — a raw headroom
+                # against an epoch timestamp — and headroom won on magnitude
+                # alone. Falling through to the weekly key instead split the
+                # filter and the sort across two axes, picking the candidate
+                # with LESS headroom whenever its weekly reset was sooner.
+                #
+                # Scoped to the SAME triggers as the gate above: at-limit and
+                # failover skip that gate deliberately, because there we are
+                # escaping a dead account rather than optimising a return time.
+                # `recovery_ts` in BOTH tiers. Tier 1 hard-coded 0.0 there,
+                # which threw away a fact already in hand: two peers with equal
+                # headroom past the horizon then tied, and the tie fell through
+                # to sequence order. Measured — active 4 pts/300h, two peers
+                # 8 pts each, one returning in 5h and one in 500h: base picks
+                # the 5h account whichever slot it occupies, this branch picked
+                # whichever came first in the list. Headroom still decides
+                # first within the tier; the reset only breaks its ties, where
+                # sooner is plainly better than lower slot number.
+                key: tuple = (
+                    (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
+                )
+            elif consume_first:
                 # 7d-heavy targets (at/over the effective 7d threshold) sink
                 # below lighter ones — deprioritize, not exclude, so 5h relief
                 # still wins when they are the only option. Within a tier:
@@ -2338,7 +3151,7 @@ class AutoSwitchEngine:
                 # headroom breaks ties, then sequence order.
                 seven_d = cand_pcts.get("7d")
                 heavy = 1 if (seven_d is not None and seven_d >= settings.eff_7d()) else 0
-                key: tuple = (
+                key = (
                     heavy,
                     reset_ts if reset_ts is not None else float("inf"),
                     -h,
@@ -2347,6 +3160,7 @@ class AutoSwitchEngine:
                 key = (-h,)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
+        qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         return [num for _, num in qualifying], any_known, active_reset_ts
 
@@ -2496,7 +3310,13 @@ class AutoSwitchEngine:
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
 
-    def _perform(self, number: str, email: str, trigger: str) -> TickOutcome:
+    def _perform(
+        self,
+        number: str,
+        email: str,
+        trigger: str,
+        left: tuple[float | None, float],
+    ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
             current_email = self.switcher.account_email(current) if current else ""
@@ -2535,6 +3355,24 @@ class AutoSwitchEngine:
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
+            # WHERE we came from, so the next tick can refuse to undo this,
+            # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
+            # cannot fake. See `_left_account_recovered` for why the present
+            # state alone cannot supply one. `inf` is stored as null: it is not
+            # portable JSON, and every other reader of this file would have to
+            # learn about it.
+            state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
+            state["leftHeadroom"], recovery = left
+            state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
+            # A `consume-first` phase-2 refetch can write the SAME (None,
+            # None) shape a `failover` departure writes, whenever the
+            # refetched active row has a `pct` but is otherwise unmeasurable
+            # in the same tick its weekly reset is known --
+            # `account_headroom` needs a numeric `pct`, `_seven_day_reset_ts`
+            # needs only `resets_at`. Inferring the trigger from the two
+            # nulls then runs the wrong legs. Record it directly so the
+            # reader never has to guess.
+            state["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
 
         self._emit(
@@ -2677,7 +3515,38 @@ class AutoSwitchEngine:
             # resumes one slow tick after they do.
             return max(interval, NO_RESET_FALLBACK_S)
         # ±10% jitter so multiple machines don't synchronize their API hits.
-        return interval * (0.9 + 0.2 * random.random())
+        return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+
+    def _respect_poll_plan(self, delay: float) -> float:
+        """Shorten a normal-cadence sleep to the store's own next-poll time.
+
+        The planner tightens the active row to URGENT_INTERVAL_S while it
+        burns toward the threshold, but the loop always slept
+        ``interval_seconds`` — so the plan ran late. Measured mid-episode: the
+        row was due 112s ago while the engine still had minutes of sleep left.
+
+        Only ever shortens, never below the planner's floor: the 429 budget
+        lives in the plan, and this makes the loop obey it rather than
+        override it. Best-effort — the unshortened delay is always safe.
+        """
+        try:
+            current = self.switcher.current_account_number()
+            if current is None:
+                return delay
+            entry = self.switcher.usage_entries_by_account(fetch=set()).get(current)
+            if entry is None or entry.next_poll_at is None:
+                return delay
+            due_in = entry.next_poll_at - self.clock()
+            # Clamp the DEADLINE, not the result. max(min(delay, due_in), U)
+            # raises a delay that was ALREADY below U: at the configurable
+            # floor of 15s it turns a 13.5s jittered sleep into 60s, and at
+            # the 60s default it flattens the entire lower jitter half.
+            # Bounding due_in instead keeps "only ever shortens" true at every
+            # configured interval, and still refuses to poll faster than the
+            # planner's own floor when the row is overdue.
+            return min(delay, max(due_in, poll_policy.URGENT_INTERVAL_S))
+        except Exception:
+            return delay
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""

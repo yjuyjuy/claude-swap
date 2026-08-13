@@ -13,6 +13,7 @@ import pytest
 from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
+    atomic_write_json,
     AutoSwitchSettings,
     SharedProfileSettings,
     UiSettings,
@@ -379,3 +380,78 @@ class TestPerWindowThresholdSettings:
         set_setting(tmp_path, "autoswitch.sevenDayThreshold", "72")
         assert unset_setting(tmp_path, "autoswitch.sevenDayThreshold") is True
         assert load_settings(tmp_path).seven_day_threshold is None
+
+
+class TestAtomicWriteThroughSymlink:
+    """A rename does not follow links, so renaming onto a symlinked path
+    detaches it and the target silently stops updating. Covers the write
+    itself plus the two placement decisions it forces: the temp file goes
+    beside the RESOLVED target (else EXDEV across mounts), the 0700 chmod
+    stays on the directory cswap owns (else it narrows — or cannot touch —
+    a foreign one)."""
+
+    def test_write_preserves_the_link_and_updates_the_target(self, tmp_path):
+        repo = tmp_path / "repo"; repo.mkdir()
+        live = tmp_path / "live"; live.mkdir()
+        tracked = repo / "settings.json"
+        tracked.write_text(json.dumps({"tracked": True}))
+        link = live / "settings.json"
+        link.symlink_to(tracked)
+
+        atomic_write_json(link, {"written": "through"})
+
+        assert link.is_symlink(), "the dotfiles link must survive the write"
+        assert json.loads(tracked.read_text()) == {"written": "through"}
+
+    def test_dangling_link_writes_where_it_points(self, tmp_path):
+        target = tmp_path / "gone" / "settings.json"
+        link = tmp_path / "settings.json"
+        link.symlink_to(target)
+
+        atomic_write_json(link, {"dangling": "ok"})
+
+        assert link.is_symlink()
+        assert json.loads(target.read_text()) == {"dangling": "ok"}
+
+    def test_plain_file_write_unchanged(self, tmp_path):
+        p = tmp_path / "settings.json"
+        atomic_write_json(p, {"plain": 1})
+        assert not p.is_symlink()
+        assert json.loads(p.read_text()) == {"plain": 1}
+
+    def test_temp_file_is_created_beside_the_target(self, tmp_path, monkeypatch):
+        """Beside the LINK, the rename hits EXDEV whenever the target is on
+        another mount — the write fails outright. Assert the placement
+        directly; staging two filesystems in a unit test is not portable."""
+        import tempfile
+        from claude_swap import settings as S
+        repo = tmp_path / "repo"; repo.mkdir()
+        live = tmp_path / "live"; live.mkdir()
+        tracked = repo / "settings.json"; tracked.write_text("{}")
+        link = live / "settings.json"; link.symlink_to(tracked)
+        seen = []
+        real_mkstemp = tempfile.mkstemp
+        monkeypatch.setattr(
+            S.tempfile, "mkstemp",
+            lambda *a, **kw: (seen.append(kw.get("dir")), real_mkstemp(*a, **kw))[1],
+        )
+
+        atomic_write_json(link, {"x": 1})
+
+        assert seen == [str(repo)], f"tmp must land beside the target, got {seen}"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+    def test_hardening_stays_on_the_directory_cswap_owns(self, tmp_path):
+        """The 0700 belongs to cswap's own dir. On the target's parent it
+        would narrow a foreign directory, and raise PermissionError when
+        that parent cannot be chmod'ed at all."""
+        repo = tmp_path / "repo"; repo.mkdir(mode=0o755)
+        live = tmp_path / "live"; live.mkdir()
+        tracked = repo / "settings.json"; tracked.write_text("{}")
+        link = live / "settings.json"; link.symlink_to(tracked)
+
+        atomic_write_json(link, {"x": 1})
+
+        assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
+        assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
+        assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"

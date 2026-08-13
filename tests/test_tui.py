@@ -396,7 +396,7 @@ class TestSnapshotSource:
         # Pacing lives in the usage store (poll plans + freshness + atomic
         # reservation), so every take is the same on-demand pass `cswap list`
         # runs — including the user's explicit refresh, which cannot bypass
-        # the store's per-token cadence.
+        # the store's per-account cadence.
         fake, source = self._source(tmp_path)
         source.take()
         source.take()
@@ -1263,7 +1263,14 @@ class TestWatchScreen:
             from textual.widgets import Static
 
             title = app.screen.query_one("#list-title", Static)
-            assert "snapshot" in title.render().plain
+            # Fresh snapshots stay quiet; the age note is a staleness alarm.
+            assert "snapshot" not in title.render().plain
+            app.snapshot = dataclasses.replace(
+                app.snapshot, taken_at=time.time() - app.SNAPSHOT_AGE_NOTE_S - 1.0
+            )
+            app._update_refresh_status()
+            await pilot.pause()
+            assert "snapshot 1m ago" in title.render().plain
             app._normal_refreshing = True
             app._normal_started_at = time.time() - app.POLL_INTERVAL_S - 1.0
             app._update_refresh_status()

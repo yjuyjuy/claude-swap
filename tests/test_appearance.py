@@ -8,13 +8,6 @@ import pytest
 from claude_swap import appearance
 
 
-@pytest.fixture(autouse=True)
-def _reset_detect_cache():
-    appearance._reset_cache()
-    yield
-    appearance._reset_cache()
-
-
 class TestParseOsc11:
     def test_parses_16bit_rgb(self):
         assert appearance._parse_osc11(b"\x1b]11;rgb:ffff/ffff/ffff\x07") == (1.0, 1.0, 1.0)
