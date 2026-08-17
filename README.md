@@ -368,6 +368,16 @@ pipx uninstall claude-swap
 - Python 3.12+
 - Claude Code installed and logged in
 
+## Fork improvements
+
+This is a fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap), maintained at [yjuyjuy/claude-swap](https://github.com/yjuyjuy/claude-swap).
+
+- **Per-window 5h/7d thresholds** with **consume-first landing** so each account's rolling limits are tracked independently.
+- **Paced shared-profile rotation** that spreads work across accounts and avoids ping-pong switching.
+- **Confirmed priming and fail-closed parking** so a swap blocks when its priming proof is stale or unverified.
+- **Slot-policy CLI contract** for configuring and persisting auto-switch slot behavior.
+- **TUI controller proof** exposing shared-profile state directly in the terminal interface.
+
 ## License
 
 MIT
