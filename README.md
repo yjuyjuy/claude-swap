@@ -370,7 +370,7 @@ pipx uninstall claude-swap
 
 ## Fork improvements
 
-This is a fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap), maintained at [yjuyjuy/claude-swap](https://github.com/yjuyjuy/claude-swap).
+This is a fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap), maintained at [hyfin-group/tooling/claude-swap](https://gitlab.com/hyfin-group/tooling/claude-swap) (GitHub mirror [yjuyjuy/claude-swap](https://github.com/yjuyjuy/claude-swap)).
 
 - **Per-window 5h/7d thresholds** with **consume-first landing** so each account's rolling limits are tracked independently.
 - **Paced shared-profile rotation** that spreads work across accounts and avoids ping-pong switching.
